@@ -1,7 +1,7 @@
 """
 Real-Time Screen Capture Depth Map Feedback Test using Songbird UART Protocol
 
-Continuously captures the full screen using pyautogui and converts it to a depth map.
+Continuously captures the full screen using DXcam (DirectX screen capture) and converts it to a depth map.
 Tracks global mouse position in real-time and sends elevation commands based on 
 the depth map value at the current mouse position. No OpenCV window is displayed.
 
@@ -11,6 +11,7 @@ Protocol:
 - Sends header 0x10 (elevation command as float)
 
 Usage: python screen_capture_test.py
+Requirements: pip install dxcam
 """
 
 import time
@@ -20,19 +21,21 @@ import pyautogui
 import cv2
 import numpy as np
 from songbird import SongbirdUART
+import dxcam
 
 
 SERIAL_PORT = "COM6"  # Change to your serial port
 SERIAL_BAUD_RATE = 460800
 
 # Screen capture settings
-CAPTURE_INTERVAL = 1.0  # Seconds between screen captures
+CAPTURE_INTERVAL = 0.0  # No artificial delay - run at maximum speed
 MOUSE_CHECK_INTERVAL = 0.01  # Seconds between mouse position checks
 
 # Elevation scale factor
 elevation_scale = 0.5
 # Depth map settings
-ksize = 5  # Gaussian blur kernel size
+DOWNSAMPLE_FACTOR = 16  # Downsample by this factor for faster processing (higher = faster)
+ksize = 1  # Gaussian blur kernel size (1 = disabled for speed)
 zres = 256         # Depth resolution levels
 invert = 1       # Invert depth map (1 or -1)
 
@@ -55,50 +58,77 @@ def scale_image(img, min_val, max_val):
     img = img - np.min(img)
     return img / np.max(img) * (max_val - min_val) + min_val
 
-def capture_screen_as_depth_map(zres, invert):
+def capture_screen_as_depth_map(camera):
     """Capture the full screen and convert it to a depth map."""
-    # Capture the screen
-    screenshot = pyautogui.screenshot()
+    # Capture frame using DXcam (much faster than mss)
+    frame = camera.grab()
     
-    # Convert PIL image to OpenCV format (BGR)
-    img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+    if frame is None:
+        return None, None
     
-    # Convert to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Frame is already a numpy array in RGB format
+    # Simple downsampling using array slicing (much faster than cv2.resize)
+    # Take every Nth pixel
+    img_small = frame[::DOWNSAMPLE_FACTOR, ::DOWNSAMPLE_FACTOR, :]
     
-    # Apply Gaussian blur
-    gray = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+    # Convert to grayscale using simple average (faster than weighted)
+    gray_small = np.mean(img_small, axis=2).astype(np.float32)
     
-    # Scale to depth resolution
-    gray = scale_image(gray, 0, zres - 1)
+    # Normalize to 0-1
+    depth_map_small = gray_small / 255.0
     
     # Invert if needed
     if invert == -1:
-        gray = (zres - 1) - gray
+        depth_map_small = 1.0 - depth_map_small
     
-    # Normalize to 0-1 range for elevation
-    depth_map = gray / (zres - 1)
-    
-    return depth_map, screenshot.size
+    # Return depth map and screen size
+    return depth_map_small, (frame.shape[1], frame.shape[0])
 
 def screen_capture_thread():
     """Thread function to continuously capture and update the screen depth map."""
     global depth_map, screen_size
     
-    print("Starting real-time screen capture thread...")
+    print("Starting real-time screen capture thread...", flush=True)
+    
+    # Create DXcam camera instance (uses DirectX for fast capture)
+    camera = dxcam.create()
+    
+    print("DXcam initialized", flush=True)
+    
+    frame_count = 0
+    start_time = time.time()
     
     while True:
         try:
+            capture_start = time.time()
+            
             # Capture screen and update depth map
-            new_depth_map, new_screen_size = capture_screen_as_depth_map(zres, invert)
+            new_depth_map, new_screen_size = capture_screen_as_depth_map(camera)
+            
+            if new_depth_map is None:
+                time.sleep(0.001)
+                continue
+            
+            capture_time = time.time() - capture_start
             
             with depth_map_lock:
                 depth_map = new_depth_map
                 screen_size = new_screen_size
             
-            time.sleep(CAPTURE_INTERVAL)
+            frame_count += 1
+            if frame_count % 100 == 0:
+                elapsed = time.time() - start_time
+                actual_fps = frame_count / elapsed
+                print(f"Capture FPS: {actual_fps:.1f}, Last capture time: {capture_time*1000:.1f}ms", flush=True)
+                # Reset counters to avoid overflow
+                frame_count = 0
+                start_time = time.time()
+            
+            # No sleep - run at maximum speed
         except Exception as e:
-            print(f"Error in screen capture thread: {e}")
+            print(f"Error in screen capture thread: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
             time.sleep(1)
 
 def get_elevation_at_position(x, y):
@@ -109,12 +139,16 @@ def get_elevation_at_position(x, y):
         if depth_map is None or screen_size is None:
             return None
         
-        # Clamp to valid range (depth map is same size as screen now)
-        x = max(0, min(x, depth_map.shape[1] - 1))
-        y = max(0, min(y, depth_map.shape[0] - 1))
+        # Map screen coordinates to downsampled depth map coordinates
+        map_x = int(x // DOWNSAMPLE_FACTOR)
+        map_y = int(y // DOWNSAMPLE_FACTOR)
+        
+        # Clamp to valid range
+        map_x = max(0, min(map_x, depth_map.shape[1] - 1))
+        map_y = max(0, min(map_y, depth_map.shape[0] - 1))
         
         # Get elevation from depth map directly
-        elevation = depth_map[y, x] * elevation_scale
+        elevation = depth_map[map_y, map_x] * elevation_scale
         
         return elevation
 
@@ -211,15 +245,22 @@ def main():
     wait_for_ping(core)
     
     # Start screen capture thread
+    print("Starting screen capture thread...", flush=True)
     capture_thread = threading.Thread(target=screen_capture_thread, daemon=True)
     capture_thread.start()
+    print(f"Thread started: {capture_thread.is_alive()}", flush=True)
     
     # Wait for initial depth map
-    print("Waiting for initial screen capture...")
+    print("Waiting for initial screen capture...", flush=True)
+    wait_count = 0
     while depth_map is None:
         time.sleep(0.1)
+        wait_count += 1
+        if wait_count % 10 == 0:
+            print(f"Still waiting... ({wait_count/10:.0f}s)", flush=True)
     
-    print(f"Screen size: {screen_size}")
+    #print(f"Screen captured at target {int(1/CAPTURE_INTERVAL)} FPS", flush=True)
+    print(f"Screen size: {screen_size}", flush=True)
     
     # Send initial elevation command
     pkt = core.create_packet(0x10)
@@ -270,16 +311,14 @@ def main():
             # Get current mouse position and send elevation command
             current_pos = pyautogui.position()
             
-            # Only send elevation if position changed or periodically
-            if last_mouse_pos != current_pos:
-                last_mouse_pos = current_pos
-                elevation = get_elevation_at_position(current_pos[0], current_pos[1])
-                
-                if elevation is not None:
-                    # Send elevation command
-                    pkt = core.create_packet(0x10)
-                    pkt.write_float(elevation)
-                    core.send_packet(pkt)
+            # Always send elevation command (updates with screen capture rate)
+            elevation = get_elevation_at_position(current_pos[0], current_pos[1])
+            
+            if elevation is not None:
+                # Send elevation command
+                pkt = core.create_packet(0x10)
+                pkt.write_float(elevation)
+                core.send_packet(pkt)
             
             time.sleep(MOUSE_CHECK_INTERVAL)  # Check mouse position frequently
     except KeyboardInterrupt:
