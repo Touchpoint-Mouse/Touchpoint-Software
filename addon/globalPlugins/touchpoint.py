@@ -8,6 +8,7 @@ import ui
 import eventHandler
 import controlTypes
 import NVDAObjects
+import logHandler
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -20,9 +21,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def __init__(self):
         """Initialize the global plugin."""
         super(GlobalPlugin, self).__init__()
-        # Opens log file
-        with open("touchpoint_nvda_log.txt", "a", encoding="utf-8") as log_file:
-            self.log_file = log_file
         self.logMessage("Touchpoint NVDA addon initialized")
 
     def terminate(self):
@@ -31,10 +29,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         super(GlobalPlugin, self).terminate()
 
     def logMessage(self, message):
+        """Log a message to the NVDA log.
         """
-        Log a message to a log file
-        """
-        self.log_file.write(message + "\n")
+        logHandler.log.info(message)
 
     def logUIElement(self, obj, eventName):
         """
@@ -46,7 +43,21 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         try:
             name = obj.name if obj.name else "Unnamed"
-            role = obj.role if hasattr(obj, 'role') else "Unknown"
+            role = obj.role if hasattr(obj, 'role') else None
+            
+            # Get the human-readable role name from controlTypes
+            if role is not None:
+                try:
+                    roleName = controlTypes.Role(role).displayString
+                except:
+                    # Fallback for older NVDA versions
+                    try:
+                        roleName = controlTypes.roleLabels.get(role, f"Unknown({role})")
+                    except:
+                        roleName = str(role)
+            else:
+                roleName = "Unknown"
+            
             value = obj.value if hasattr(obj, 'value') and obj.value else ""
             states = obj.states if hasattr(obj, 'states') else set()
             location = obj.location if hasattr(obj, 'location') else None
@@ -54,13 +65,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             info = {
                 'event': eventName,
                 'name': name,
-                'role': role,
+                'role': roleName,
                 'value': value,
                 'states': str(states),
                 'location': location
             }
             
-            self.logMessage(f"Event: {eventName} | Name: {name} | Role: {role}")
+            self.logMessage(f"Event: {eventName} | Name: {name} | Role: {roleName}")
             
             # You can extend this to send data to external systems
             # For example: send to serial port, TCP socket, or save to file
