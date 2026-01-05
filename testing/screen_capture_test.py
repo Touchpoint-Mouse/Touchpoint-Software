@@ -231,25 +231,23 @@ def main():
             elevation = get_elevation_at_position(current_pos[0], current_pos[1])
             
             # Send vibration command if exactly on border
-            if (current_pos[0] <= 0 or current_pos[0] >= screen_size[0] - 1 or
-                current_pos[1] <= 0 or current_pos[1] >= screen_size[1] - 1):
-                if not on_border:
-                    # Send vibration command
-                    pkt = core.create_packet(H_VIBRATION)
-                    pkt.write_float(vibration_amplitude)
-                    pkt.write_float(vibration_freq)
-                    pkt.write_int16(0)  # Duration 0 = continuous
-                    core.send_packet(pkt)
-                    on_border = True
-            else:
-                if on_border:
-                    # Send vibration off command
-                    pkt = core.create_packet(H_VIBRATION)
-                    pkt.write_float(0)
-                    pkt.write_float(0)
-                    pkt.write_int16(0)
-                    core.send_packet(pkt)
-                    on_border = False
+            pos_on_border = current_pos[0] <= 0 or current_pos[0] >= screen_size[0] - 1 or current_pos[1] <= 0 or current_pos[1] >= screen_size[1] - 1
+            if pos_on_border and (not on_border):
+                # Send vibration command
+                pkt = core.create_packet(H_VIBRATION)
+                pkt.write_float(vibration_amplitude)
+                pkt.write_float(vibration_freq)
+                pkt.write_int16(0)  # Duration 0 = continuous
+                core.send_packet(pkt)
+                on_border = True
+            elif (not pos_on_border) and on_border:
+                # Send vibration off command
+                pkt = core.create_packet(H_VIBRATION)
+                pkt.write_float(0)
+                pkt.write_float(0)
+                pkt.write_int16(0)
+                core.send_packet(pkt)
+                on_border = False
             
             if elevation is not None:
                 # Send elevation command

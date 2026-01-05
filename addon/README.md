@@ -1,15 +1,36 @@
 # Touchpoint NVDA Addon
 
-This NVDA addon captures UI element events for the Touchpoint project.
+This NVDA addon provides haptic feedback for image depth maps using the Touchpoint device.
 
 ## Features
 
-- Monitors focus changes on UI elements
-- Captures value and state changes
-- Tracks menu events
-- Logs alerts and notifications
-- Records keyboard input events
-- Monitors document loading events
+- Detects when mouse enters/exits image objects
+- Captures screen regions containing images
+- Converts grayscale images to depth maps
+- Sends elevation data to Songbird UART device
+- Provides vibration feedback on image boundaries
+- Integrates with NVDA's accessibility tree
+
+## Dependencies
+
+This addon requires external Python packages:
+- **numpy**: For depth map calculations
+- **dxcam**: For screen capture
+- **opencv-python**: For image processing
+
+### Installation (Development)
+
+For development testing, install dependencies directly to NVDA's Python:
+
+1. Open NVDA Python Console: `NVDA+Control+Z`
+2. Run:
+```python
+import subprocess, sys
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'dxcam', 'opencv-python'])
+```
+3. Restart NVDA
+
+See [DEPENDENCY_MANAGEMENT.md](../DEPENDENCY_MANAGEMENT.md) for detailed information.
 
 ## Installation
 
