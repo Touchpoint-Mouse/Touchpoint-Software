@@ -245,7 +245,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self.logMessage(f"[ERROR] Screen capture thread failed: {e}")
     
     def _is_image_object(self, obj):
-        """Check if an NVDA object is an image."""
+        """Check if an NVDA object is an image or video."""
         if not obj:
             return False
         
@@ -256,6 +256,29 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             
             # Check if role is GRAPHIC, IMAGE, or IMAGEMAP
             is_img = role in self.image_roles
+            
+            # Also check for video tags in IAccessible2 attributes
+            if not is_img:
+                try:
+                    # Try different attribute properties
+                    ia2_attrs = None
+                    if hasattr(obj, 'IA2Attributes'):
+                        ia2_attrs = obj.IA2Attributes
+                    elif hasattr(obj, 'IAccessibleObject') and hasattr(obj.IAccessibleObject, 'attributes'):
+                        ia2_attrs = obj.IAccessibleObject.attributes
+                    
+                    if ia2_attrs:
+                        # IA2Attributes can be a dict or a string
+                        if isinstance(ia2_attrs, dict):
+                            if ia2_attrs.get('tag') == 'video':
+                                is_img = True
+                                self.logMessage(f"[DEBUG] Detected video tag (dict) as image: {obj.name if hasattr(obj, 'name') else 'Unnamed'}")
+                        elif isinstance(ia2_attrs, str):
+                            if 'tag:video' in ia2_attrs:
+                                is_img = True
+                                self.logMessage(f"[DEBUG] Detected video tag (string) as image: {obj.name if hasattr(obj, 'name') else 'Unnamed'}")
+                except Exception as attr_err:
+                    self.logMessage(f"[DEBUG] Error checking IA2 attributes: {attr_err}")
             
             # Debug: Log role information for objects we check
             if is_img:
@@ -345,6 +368,33 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 # Check what object is under the mouse cursor
                 try:
                     mouse_obj = NVDAObjects.NVDAObject.objectFromPoint(current_pos[0], current_pos[1])
+                    
+                    # Log IAccessible and IAccessible2 attributes for debugging
+                    if mouse_obj:
+                        try:
+                            attrs_log = f"[DEBUG] Object under mouse: name='{mouse_obj.name if hasattr(mouse_obj, 'name') else 'N/A'}', "
+                            attrs_log += f"role={mouse_obj.role if hasattr(mouse_obj, 'role') else 'N/A'}"
+                            
+                            # Log IA2Attributes if available
+                            if hasattr(mouse_obj, 'IA2Attributes'):
+                                ia2_attrs = mouse_obj.IA2Attributes
+                                attrs_log += f", IA2Attributes type={type(ia2_attrs).__name__}"
+                                if ia2_attrs:
+                                    if isinstance(ia2_attrs, dict):
+                                        attrs_log += f", IA2Attributes dict={ia2_attrs}"
+                                    else:
+                                        attrs_log += f", IA2Attributes='{ia2_attrs}'"
+                            else:
+                                attrs_log += ", IA2Attributes=None"
+                            
+                            # Log IAccessibleObject attributes if available
+                            if hasattr(mouse_obj, 'IAccessibleObject'):
+                                if hasattr(mouse_obj.IAccessibleObject, 'attributes'):
+                                    attrs_log += f", IAccessibleObject.attributes='{mouse_obj.IAccessibleObject.attributes}'"
+                            
+                            self.logMessage(attrs_log)
+                        except Exception as log_err:
+                            self.logMessage(f"[DEBUG] Error logging object attributes: {log_err}")
                     
                     is_image = self._is_image_object(mouse_obj)
                     was_on_image = self.current_image_obj is not None
