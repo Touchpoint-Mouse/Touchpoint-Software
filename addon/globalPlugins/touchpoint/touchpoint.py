@@ -58,6 +58,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     # Header definitions
     H_PING = 0xFF
     H_ELEVATION = 0x10
+    H_ELEVATION_SPEED = 0x11
     H_VIBRATION = 0x20
     
     # Depth map settings
@@ -76,6 +77,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.enabled = True
         self.depth_map = None
         self.depth_map_lock = threading.Lock()
+        self.max_elevation_speed = 2.0 # units per second
         self.uart = None
         self.core = None
         self.capture_thread = None
@@ -117,6 +119,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             
             # Wait for device ping
             self._wait_for_ping()
+            
+            # Sends max elevation speed to device
+            pkt = self.core.create_packet(self.H_ELEVATION_SPEED)
+            pkt.write_float(self.max_elevation_speed)
+            # Make a guaranteed send
+            self.core.send_packet(pkt, True)
             
             # Note: mss will be initialized in the capture thread due to thread-local storage requirements
             
