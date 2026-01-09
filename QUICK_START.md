@@ -16,7 +16,7 @@ Get the Touchpoint addon running in NVDA with proper dependency management.
 2. Press `NVDA+Control+Z` to open Python Console
 3. Copy and paste this command:
 ```python
-import subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'dxcam', 'opencv-python'])
+import subprocess, sys; subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'mss', 'opencv-python'])
 ```
 4. Wait for installation to complete
 5. Close the console and restart NVDA
@@ -36,9 +36,9 @@ exec(open(r'C:\Users\carso\Documents\GitHub\Project-Touchstone\Touchpoint-Softwa
 2. Test imports:
 ```python
 import numpy as np
-import dxcam
+import mss
 print(f"NumPy {np.__version__} - OK")
-print(f"DXcam - OK")
+print(f"mss - OK")
 ```
 
 If you see version numbers, you're good!
@@ -73,7 +73,7 @@ xcopy "C:\Users\carso\Documents\GitHub\Project-Touchstone\Touchpoint-Software\ad
 1. Check NVDA log (NVDA → Tools → View Log):
    - Should see: "Touchpoint NVDA addon initialized"
    - Should see: "Ping received from microcontroller"
-   - Should see: "DXcam initialized"
+   - Should see: "mss initialized"
 
 2. Test functionality:
    - Open a web browser with images
@@ -88,8 +88,8 @@ xcopy "C:\Users\carso\Documents\GitHub\Project-Touchstone\Touchpoint-Software\ad
 **Symptom**: Error message about missing dependencies
 
 **Solution**:
-1. Verify installation: NVDA Console → `import numpy, dxcam`
-2. Reinstall: `subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', 'numpy', 'dxcam', 'opencv-python'])`
+1. Verify installation: NVDA Console → `import numpy, mss`
+2. Reinstall: `subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', 'numpy', 'mss', 'opencv-python'])`
 
 ### "Failed to open serial port"
 

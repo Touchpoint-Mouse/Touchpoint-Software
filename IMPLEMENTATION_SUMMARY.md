@@ -42,7 +42,7 @@ Implemented a dependency management system based on the proven approach from the
 1. Install dependencies directly to NVDA's Python using NVDA Console:
    ```python
    import subprocess, sys
-   subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'dxcam', 'opencv-python'])
+   subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'mss', 'opencv-python'])
    ```
 
 2. Restart NVDA
@@ -81,9 +81,9 @@ Implemented a dependency management system based on the proven approach from the
 2. **Verify imports work**:
    ```python
    import numpy as np
-   import dxcam
+   import mss
    print(f"NumPy version: {np.__version__}")
-   print(f"DXcam imported successfully")
+   print(f"mss imported successfully")
    ```
 
 3. **Load the addon**:

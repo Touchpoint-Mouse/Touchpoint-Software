@@ -1,7 +1,7 @@
 """
 Real-Time Screen Capture Depth Map Feedback Test using Songbird UART Protocol
 
-Continuously captures the full screen using DXcam (DirectX screen capture) and converts it to a depth map.
+Continuously captures the full screen using mss (Python screenshot library) and converts it to a depth map.
 Tracks global mouse position in real-time and sends elevation commands based on 
 the depth map value at the current mouse position. No OpenCV window is displayed.
 
@@ -11,7 +11,7 @@ Protocol:
 - Sends header 0x20 (vibration command when mouse is on screen border)
 
 Usage: python screen_capture_test.py
-Requirements: pip install dxcam
+Requirements: pip install mss
 """
 
 import time
@@ -21,7 +21,7 @@ import pyautogui
 import cv2
 import numpy as np
 from songbird import SongbirdUART
-import dxcam
+import mss
 
 
 SERIAL_PORT = "COM6"  # Change to your serial port
@@ -62,13 +62,19 @@ def scale_image(img, min_val, max_val):
 
 def capture_screen_as_depth_map(camera):
     """Capture the full screen and convert it to a depth map."""
-    # Capture frame using DXcam (much faster than mss)
-    frame = camera.grab()
+    # Capture frame using mss (cross-platform, reliable)
+    # Monitor 1 is the primary display
+    screenshot = camera.grab(camera.monitors[1])
     
-    if frame is None:
+    if screenshot is None:
         return None, None
     
-    # Frame is already a numpy array in RGB format
+    # Convert mss screenshot to numpy array
+    frame = np.array(screenshot)
+    
+    # mss returns BGRA, extract BGR channels
+    frame = frame[:, :, :3]
+    
     # Simple downsampling using array slicing (much faster than cv2.resize)
     # Take every Nth pixel
     img_small = frame[::DOWNSAMPLE_FACTOR, ::DOWNSAMPLE_FACTOR, :]
@@ -84,7 +90,7 @@ def capture_screen_as_depth_map(camera):
         depth_map_small = 1.0 - depth_map_small
     
     # Return depth map and screen size
-    return depth_map_small, (frame.shape[1], frame.shape[0])
+    return depth_map_small, (screenshot.width, screenshot.height)
 
 def screen_capture_thread():
     """Thread function to continuously capture and update the screen depth map."""
@@ -92,10 +98,10 @@ def screen_capture_thread():
     
     print("Starting real-time screen capture thread...", flush=True)
     
-    # Create DXcam camera instance (uses DirectX for fast capture)
-    camera = dxcam.create()
+    # Create mss instance
+    camera = mss.mss()
     
-    print("DXcam initialized", flush=True)
+    print("mss initialized", flush=True)
     
     frame_count = 0
     start_time = time.time()

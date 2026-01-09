@@ -15,7 +15,7 @@ This NVDA addon provides haptic feedback for image depth maps using the Touchpoi
 
 This addon requires external Python packages:
 - **numpy**: For depth map calculations
-- **dxcam**: For screen capture
+- **mss**: For screen capture
 - **opencv-python**: For image processing
 
 ### Installation (Development)
@@ -26,7 +26,7 @@ For development testing, install dependencies directly to NVDA's Python:
 2. Run:
 ```python
 import subprocess, sys
-subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'dxcam', 'opencv-python'])
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'mss', 'opencv-python'])
 ```
 3. Restart NVDA
 

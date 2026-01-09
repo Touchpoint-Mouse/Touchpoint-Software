@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Touchpoint NVDA addon requires external Python dependencies (numpy, dxcam, opencv-python) that are not part of the standard NVDA installation. This document explains how dependencies are managed, based on the proven approach used by the AI-content-describer addon.
+The Touchpoint NVDA addon requires external Python dependencies (numpy, mss, opencv-python) that are not part of the standard NVDA installation. This document explains how dependencies are managed, based on the proven approach used by the AI-content-describer addon.
 
 ## How It Works
 
@@ -37,7 +37,7 @@ The addon uses a `dependency_checker.py` module that:
 
 ```python
 import subprocess, sys
-subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'dxcam', 'opencv-python'])
+subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'numpy', 'mss', 'opencv-python'])
 ```
 
 4. Restart NVDA
@@ -60,7 +60,7 @@ exec(open(r'C:\Users\carso\Documents\GitHub\Project-Touchstone\Touchpoint-Softwa
 
 2. Run from Windows PowerShell:
 ```powershell
-& "C:\Program Files (x86)\NVDA\pythonw.exe" -m pip install numpy dxcam opencv-python
+& "C:\Program Files (x86)\NVDA\pythonw.exe" -m pip install numpy mss opencv-python
 ```
 
 3. Restart NVDA
@@ -74,7 +74,7 @@ Our previous attempts to bundle dependencies in a `lib` folder failed because:
 - **Binary extensions (.pyd files)** cannot be reliably imported from custom paths
 - Python's import system requires compiled extensions to be in `site-packages`
 - Using `pip install --target lib/` works for pure Python, but not C extensions
-- Numpy, OpenCV, and DXcam all use compiled C/C++ extensions
+- Numpy, OpenCV, and mss all use compiled C/C++ extensions
 
 ### The Solution
 
@@ -97,7 +97,7 @@ To distribute the addon with automatic dependency installation:
 
 1. **Build dependency package**:
 ```powershell
-pip download numpy dxcam opencv-python --platform win_amd64 --python-version 3.11 --only-binary=:all: -d deps
+pip download numpy mss opencv-python --platform win_amd64 --python-version 3.11 --only-binary=:all: -d deps
 # Create ZIP of the downloaded wheels
 ```
 
@@ -132,4 +132,4 @@ def get_dependencies_url():
 
 - [AI-content-describer dependency_checker.py](https://github.com/cartertemm/AI-content-describer/blob/main/addon/globalPlugins/AIContentDescriber/dependency_checker.py)
 - NVDA Python is 3.11 (as of NVDA 2024.1)
-- DXcam requires numpy and opencv-python
+- mss is a pure Python cross-platform screen capture library

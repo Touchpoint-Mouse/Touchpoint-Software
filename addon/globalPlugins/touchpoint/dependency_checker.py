@@ -123,7 +123,7 @@ def prompt_not_found():
     return show_question(
         None,
         "Touchpoint",
-        "The Touchpoint addon requires additional dependencies (numpy, dxcam, opencv-python, songbird) "
+        "The Touchpoint addon requires additional dependencies (numpy, mss, opencv-python, songbird) "
         "that are not installed. Would you like to download and install them now?\n\n"
         "NVDA will need to be restarted after installation."
     )
@@ -206,7 +206,7 @@ def check_dependencies():
     # First check if dependencies are already importable
     try:
         import numpy
-        import dxcam
+        import mss
         import cv2
         import songbird
         return True
@@ -219,7 +219,7 @@ def check_dependencies():
         expand_path()
         try:
             import numpy
-            import dxcam
+            import mss
             import cv2
             import songbird
             return True
