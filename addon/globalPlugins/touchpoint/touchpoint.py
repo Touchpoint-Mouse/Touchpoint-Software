@@ -27,13 +27,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 # Expand dependencies path if available
 dependency_checker.expand_path()
 
-# Import only numpy and songbird at module level
-# mss will be imported lazily when needed
+# Import external dependencies
 try:
     import numpy as np
     import mss
     import cv2
-    from songbird import SongbirdUART
+    import songbird
     DEPENDENCIES_AVAILABLE = True
     IMPORT_ERROR = None
 except ImportError as e:
@@ -41,25 +40,17 @@ except ImportError as e:
     IMPORT_ERROR = str(e)
     np = None
     SongbirdUART = None
+    
+from hardware_driver import HardwareDriver
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     """
     Global plugin that monitors and logs NVDA UI element events.
     This plugin captures various events like focus changes, mouse movements,
-    and object state changes. Integrates with screen capture and Songbird UART
+    and object state changes. Integrates with screen capture and hardware driver
     for haptic feedback based on screen depth maps.
     """
-    
-    # Configuration
-    SERIAL_PORT = "COM6"
-    SERIAL_BAUD_RATE = 460800
-    
-    # Header definitions
-    H_PING = 0xFF
-    H_ELEVATION = 0x10
-    H_ELEVATION_SPEED = 0x11
-    H_VIBRATION = 0x20
     
     # Depth map settings
     ELEVATION_SCALE = 0.5
@@ -78,8 +69,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.depth_map = None
         self.depth_map_lock = threading.Lock()
         self.max_elevation_speed = 2.0 # units per second
-        self.uart = None
-        self.core = None
+        self.hardware = HardwareDriver()
         self.capture_thread = None
         self.mouse_thread = None
         self.last_mouse_pos = None
@@ -106,25 +96,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.logMessage("Touchpoint NVDA addon initialized")
     
     def _initialize_async(self):
-        """Initialize Songbird UART and screen capture asynchronously."""
+        """Initialize hardware driver and screen capture asynchronously."""
         try:
-            # Initialize UART
-            self.uart = SongbirdUART("Touchpoint NVDA Addon")
-            self.core = self.uart.get_protocol()
+            # Initialize hardware driver
+            self.hardware.initialize()
             
-            if not self.uart.begin(self.SERIAL_PORT, self.SERIAL_BAUD_RATE):
-                self.logMessage(f"[ERROR] Failed to open serial port {self.SERIAL_PORT}")
-                self.enabled = False
-                return
-            
-            # Wait for device ping
-            self._wait_for_ping()
-            
-            # Sends max elevation speed to device
-            pkt = self.core.create_packet(self.H_ELEVATION_SPEED)
-            pkt.write_float(self.max_elevation_speed)
-            # Make a guaranteed send
-            self.core.send_packet(pkt, True)
+            # Set max elevation speed
+            self.hardware.set_max_elevation_speed(self.max_elevation_speed)
             
             # Note: mss will be initialized in the capture thread due to thread-local storage requirements
             
@@ -144,26 +122,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self.logMessage(traceback.format_exc())
             self.enabled = False
     
-    def _wait_for_ping(self):
-        """Wait for ping response from microcontroller."""
-        time.sleep(1)
-        self.core.flush()
-        self.logMessage("Waiting for ping from microcontroller...")
-        
-        response = None
-        timeout_count = 0
-        while not response and timeout_count < 10:
-            response = self.core.wait_for_header(self.H_PING, 1000)
-            self.core.flush()
-            timeout_count += 1
-        
-        if response:
-            # Send response back to acknowledge ping
-            pkt = self.core.create_packet(self.H_PING)
-            self.core.send_packet(pkt)
-            self.logMessage("Ping received from microcontroller")
-        else:
-            raise Exception("Timeout waiting for microcontroller ping")
+    
     
     def _capture_screen_as_depth_map(self, camera, region=None):
         """Capture screen (or region) and convert it to a depth map.
@@ -485,13 +444,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self.logMessage(f"[ERROR] Failed to get image location: {e}, obj={obj.name if hasattr(obj, 'name') and obj.name else 'Unnamed'}")
         
         # Send brief vibration pulse on entering image
-        if self.core:
-            pass
-            pkt = self.core.create_packet(self.H_VIBRATION)
-            pkt.write_float(0.08)  # amplitude
-            pkt.write_float(150)   # frequency
-            pkt.write_int16(3)   # duration (3 count pulse)
-            self.core.send_packet(pkt)
+        self.hardware.send_vibration(0.08, 150, 3)
     
     def _handle_image_leave(self):
         """Handle mouse leaving an image object."""
@@ -506,29 +459,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.logMessage("Mouse left image - capture disabled")
         
         # Send brief vibration pulse on leaving image
-        if self.core:
-            pass
-            pkt = self.core.create_packet(self.H_VIBRATION)
-            pkt.write_float(0.05)  # amplitude (slightly lower)
-            pkt.write_float(100)   # frequency
-            pkt.write_int16(2)    # duration (2 count pulse)
-            self.core.send_packet(pkt)
-            # Send zero elevation when leaving image
-            pkt = self.core.create_packet(self.H_ELEVATION)
-            pkt.write_float(0.0)
-            self.core.send_packet(pkt)
+        self.hardware.send_vibration(0.05, 100, 2)
+        # Send zero elevation when leaving image
+        self.hardware.send_elevation(0.0)
     
     def terminate(self):
         """Clean up when the plugin is terminated."""
         self.logMessage("Touchpoint NVDA addon terminating...")
         self.enabled = False
         
-        # Close UART connection
-        if self.uart:
-            try:
-                self.uart.close()
-            except:
-                pass
+        # Close hardware driver
+        self.hardware.terminate()
         
         self.logMessage("Touchpoint NVDA addon terminated")
         super(GlobalPlugin, self).terminate()
