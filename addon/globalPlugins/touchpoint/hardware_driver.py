@@ -17,6 +17,8 @@ class HardwareDriver:
         self.uart = SongbirdUART("Touchpoint NVDA Addon")
         self.core = self.uart.get_protocol()
         self.enabled = True
+        # Current elevation state
+        self.elevation = 0.0
     
     def initialize(self):
         """Initialize the hardware driver and establish communication."""
@@ -82,6 +84,17 @@ class HardwareDriver:
         pkt = self.core.create_packet(self.H_ELEVATION)
         pkt.write_float(elevation)
         self.core.send_packet(pkt)
+        
+        # Update current elevation state
+        self.elevation = elevation
+        
+    def add_elevation_offset(self, offset):
+        """Add an elevation offset to the current elevation."""
+        if not self.enabled:
+            return
+        new_elevation = self.elevation + offset
+        self.send_elevation(new_elevation)
+    
         
     def terminate(self):
         """Terminate the hardware driver and close communication."""
