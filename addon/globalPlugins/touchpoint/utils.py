@@ -1,12 +1,12 @@
 import logHandler
 import controlTypes
 
-def logMessage(self, message):
+def logMessage(message):
         """Log a message to the NVDA log.
         """
         logHandler.log.info(message)
 
-def logUIElement(self, obj, eventName):
+def logUIElement(obj, eventName):
     """
     Log information about a UI element.
     
@@ -44,10 +44,10 @@ def logUIElement(self, obj, eventName):
             'location': location
         }
         
-        self.logMessage(f"Event: {eventName} | Name: {name} | Role: {roleName}")
+        logMessage(f"Event: {eventName} | Name: {name} | Role: {roleName}")
         
         # You can extend this to send data to external systems
         # For example: send to serial port, TCP socket, or save to file
         
     except Exception as e:
-        self.logMessage(f"Error logging UI element: {str(e)}")
+        logMessage(f"Error logging UI element: {str(e)}")

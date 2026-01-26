@@ -18,30 +18,8 @@ import ctypes
 from .utils import logMessage, logUIElement
 from .handlers import HandlerManager, ObjectHandler
 from .handler_list import objectHandlerList, globalHandlerList
-
-# Check and setup dependencies first
-module_path = os.path.abspath(os.path.dirname(__file__))
-sys.path.insert(0, module_path)
-import dependency_checker
-
-# Add parent directory to path to import songbird
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-
-# Expand dependencies path if available
-dependency_checker.expand_path()
-
-# Import external dependencies (except for mss which is thread local)
-try:
-    import numpy as np
-    import cv2
-    import songbird
-    DEPENDENCIES_AVAILABLE = True
-    IMPORT_ERROR = None
-except ImportError as e:
-    DEPENDENCIES_AVAILABLE = False
-    IMPORT_ERROR = str(e)
-    
-from hardware_driver import HardwareDriver
+from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
+from .hardware_driver import HardwareDriver
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -53,7 +31,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     """
     
     # Mouse check interval
-    MOUSE_CHECK_INTERVAL = 0.01
+    EVENT_CHECK_INTERVAL = 0.01
     
     def __init__(self):
         """Initialize the global plugin."""
@@ -76,18 +54,15 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         
         # Threading
         self.capture_thread = None
-        self.mouse_thread = None
+        self.event_thread = None
         
         # State variables
-        self.last_mouse_pos = None
-        self.on_border = False
-        self.capture_enabled = False
-        self.camera = None
         self.curr_obj = None
         self.curr_obj_id = None
         
         # Capture callback system
-        self.capture_regions = []  # List of (handler, region, callback) tuples
+        self.camera = None
+        self.capture_regions = {}  # Dict mapping handler -> region
         self.depth_map_lock = threading.Lock()
         
         # Get full screen size for border detection
@@ -122,9 +97,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self.capture_thread = threading.Thread(target=self._screen_capture_thread, daemon=True)
             self.capture_thread.start()
             
-            # Start mouse tracking thread
-            self.mouse_thread = threading.Thread(target=self._mouse_tracking_thread, daemon=True)
-            self.mouse_thread.start()
+            # Start event tracking thread
+            self.event_thread = threading.Thread(target=self._event_tracking_thread, daemon=True)
+            self.event_thread.start()
             
             logMessage("Touchpoint NVDA addon running")
             
@@ -146,12 +121,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             return
         
         with self.depth_map_lock:
-            # Check if this handler already has a region registered
-            self.capture_regions = [(h, r) for h, r in self.capture_regions if h != handler]
-            # Add the new region
-            self.capture_regions.append((handler, region))
-        
-        logMessage(f"Added capture region for {handler.__class__.__name__}: {region}")
+            self.capture_regions[handler] = region
     
     def remove_capture_region(self, handler):
         """Remove a handler's capture region.
@@ -160,12 +130,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             handler: The handler object to remove
         """
         with self.depth_map_lock:
-            original_count = len(self.capture_regions)
-            self.capture_regions = [(h, r) for h, r in self.capture_regions if h != handler]
-            removed_count = original_count - len(self.capture_regions)
-            
-        if removed_count > 0:
-            logMessage(f"Removed capture region for {handler.__class__.__name__}")
+            if handler in self.capture_regions:
+                del self.capture_regions[handler]
     
     
     def _capture_screen_region(self, camera, region):
@@ -223,7 +189,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 try:
                     # Capture all registered regions
                     with self.depth_map_lock:
-                        regions_to_capture = list(self.capture_regions)  # Create copy to avoid lock issues
+                        regions_to_capture = list(self.capture_regions.items())  # Create copy to avoid lock issues
                     
                     if regions_to_capture:
                         # Process each registered region
@@ -258,7 +224,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         Returns a tuple that uniquely identifies the object using:
         - windowHandle
         - IAccessibleChildID (if available)
-        - location as fallback
+        - name
+        - role
         """
         if not obj:
             return None
@@ -267,18 +234,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Start with window handle
             hwnd = obj.windowHandle if hasattr(obj, 'windowHandle') else None
             
-            # Try to get IAccessible child ID for more precision
+            # Try to get IAccessible child ID
             child_id = None
             if hasattr(obj, 'IAccessibleChildID'):
                 child_id = obj.IAccessibleChildID
+                
+            # Use name and role for more uniqueness
+            name = obj.name if hasattr(obj, 'name') else None
+            role = obj.role if hasattr(obj, 'role') else None
             
-            # Also include location for additional uniqueness
-            location = None
-            if hasattr(obj, 'location') and obj.location:
-                loc = obj.location
-                location = (loc.left, loc.top, loc.right, loc.bottom)
-            
-            return (hwnd, child_id, location)
+            return (hwnd, child_id, name, role)
         except:
             return None
         
@@ -291,8 +256,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """Get the full screen size as (width, height)."""
         return self.screen_size
     
-    def _mouse_tracking_thread(self):
-        """Thread to track mouse position and send elevation commands."""
+    def _event_tracking_thread(self):
+        """Thread to track mouse position and trigger handlers."""
         
         while self.enabled:
             # Get current mouse position using NVDA's winUser
@@ -302,23 +267,30 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             mouse_obj = NVDAObjects.NVDAObject.objectFromPoint(current_pos[0], current_pos[1])
                 
             # Log IAccessible and IAccessible2 attributes for debugging
-            if mouse_obj and self.curr_obj:
-                # Compare objects by their unique ID
+            if mouse_obj:
+                # Gets unique id for object under mouse
                 mouse_id = self._get_object_id(mouse_obj)
-                if mouse_id != self.curr_obj_id:
-                    # Call enter/leave handlers for object change
-                    for handler in self.objectHandlers.handlers:
-                        if handler.matches(self.curr_obj):
-                            handler.handle_event('leave', self.curr_obj)
-                    for handler in self.objectHandlers.handlers:
-                        if handler.matches(mouse_obj):
-                            handler.handle_event('enter', mouse_obj)
+                
+                # If there is a valid previous object, compare by ID
+                if self.curr_obj:
+                    if mouse_id != self.curr_obj_id:
+                        # Call enter/leave handlers for object change
+                        for handler in self.objectHandlers.handlers:
+                            if handler.matches(self.curr_obj):
+                                handler.handle_event('leave', self.curr_obj)
+                        for handler in self.objectHandlers.handlers:
+                            if handler.matches(mouse_obj):
+                                handler.handle_event('enter', mouse_obj)
+                
+                # Update current object and ID
+                self.curr_obj = mouse_obj
+                self.curr_obj_id = mouse_id
             
             # Run global handlers
             for handler in self.globalHandlers.handlers:
                 if handler.matches():
                     handler()
-            time.sleep(self.MOUSE_CHECK_INTERVAL)
+            time.sleep(self.EVENT_CHECK_INTERVAL)
     
     def terminate(self):
         """Clean up when the plugin is terminated."""

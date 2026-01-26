@@ -3,15 +3,14 @@ from xml.sax import handler
 from .filters import GlobalFilter, ObjectFilter, GraphicFilter
 from .utils import logMessage
 from .effects import Effect
-import cv2
-import numpy as np
+from .dependencies import cv2, np
 
 class HandlerManager:
     """Class to manage multiple NVDA object handlers."""
     
-    def __init__(self, plugin, handlers = []):
+    def __init__(self, plugin, handlers=None):
         self.plugin = plugin
-        self.handlers = handlers
+        self.handlers = handlers if handlers is not None else []
         
     def add_handler(self, handler):
         """Add a new handler to the manager."""
@@ -136,8 +135,8 @@ class GraphicHandler(ObjectHandler):
             
         # Calculate relative position in the depth map
         mouse_pos = self.plugin.get_mouse_position()
-        rel_x = int((mouse_pos[0] - region.left) * map.shape[1] / self.region.width)
-        rel_y = int((mouse_pos[1] - region.top) * map.shape[0] / self.region.height)
+        rel_x = int((mouse_pos[0] - region.left) * map.shape[1] / region.width)
+        rel_y = int((mouse_pos[1] - region.top) * map.shape[0] / region.height)
         
         # Clamp coordinates
         rel_x = max(0, min(map.shape[1] - 1, rel_x))
@@ -182,7 +181,7 @@ class ScreenBorderHandler(GlobalHandler):
         super().__init__(filter, effects)
         self.on_border = False  # Track if mouse is currently on border
     
-    def run(self):
+    def __call__(self):
         """Check mouse position and generate border events."""
         current_pos = self.plugin.get_mouse_position()
         full_screen_width, full_screen_height = self.plugin.get_screen_size()

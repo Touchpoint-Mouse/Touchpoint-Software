@@ -70,6 +70,8 @@ class ComboGlobalFilter(GlobalFilter):
         return True
     
 class GraphicFilter(ObjectFilter):
+    IMAGE_ROLES = (controlTypes.Role.GRAPHIC, controlTypes.Role.IMAGEMAP)
+    
     """Filter to identify graphic-related NVDA objects."""
     def matches(self, plugin, obj):
         """Check if the given NVDA object is a graphic (image or video).
@@ -88,8 +90,8 @@ class GraphicFilter(ObjectFilter):
             if role is None:
                 return False
             
-            # Check if role is GRAPHIC, IMAGE, or IMAGEMAP
-            is_img = role in self.image_roles
+            # Check if role is GRAPHIC or IMAGEMAP
+            is_img = role in self.IMAGE_ROLES
             
             # Also check for video tags in IAccessible2 attributes
             if not is_img:
@@ -111,5 +113,5 @@ class GraphicFilter(ObjectFilter):
             
             return is_img
         except Exception as e:
-            self.logMessage(f"[DEBUG] Error checking if image: {e}")
+            logMessage(f"[DEBUG] Error checking if image: {e}")
             return False

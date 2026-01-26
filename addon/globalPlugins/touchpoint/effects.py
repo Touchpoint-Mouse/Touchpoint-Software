@@ -10,6 +10,17 @@ class Effect:
             **kwargs: Additional event-specific parameters
         """
         raise NotImplementedError("Effect subclasses must implement __call__")
+
+class ComboEffect(Effect):
+    """Class to combine multiple Effect objects."""
+    
+    def __init__(self, effects=[]):
+        self.effects = effects
+        
+    def __call__(self, handler, obj=None, **kwargs):
+        """Execute all combined effects."""
+        for effect in self.effects:
+            effect(handler, obj, **kwargs)
     
 class VibrationEffect(Effect):
     """Effect to send a vibration command to the Touchpoint device."""

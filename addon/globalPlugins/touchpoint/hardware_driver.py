@@ -1,6 +1,7 @@
 import time
 
 from songbird import SongbirdUART
+from .utils import logMessage
 
 class HardwareDriver:
     # Header definitions
@@ -49,7 +50,7 @@ class HardwareDriver:
         """Wait for ping response from microcontroller."""
         time.sleep(1)
         self.core.flush()
-        self.logMessage("Waiting for ping from microcontroller...")
+        logMessage("Waiting for ping from microcontroller...")
         
         response = None
         timeout_count = 0
@@ -62,7 +63,7 @@ class HardwareDriver:
             # Send response back to acknowledge ping
             pkt = self.core.create_packet(self.H_PING)
             self.core.send_packet(pkt)
-            self.logMessage("Ping received from microcontroller")
+            logMessage("Ping received from microcontroller")
             return True
         else:
             return False
