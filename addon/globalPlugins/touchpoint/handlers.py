@@ -146,7 +146,7 @@ class GraphicHandler(ObjectHandler):
         depth_value = map[rel_y, rel_x]
         
         # Calculate elevation command
-        elevation = (depth_value - 0.5) * 2.0 * self.ELEVATION_SCALE
+        elevation = depth_value * self.ELEVATION_SCALE
         
         # Send elevation command to hardware
         self.plugin.hardware.send_elevation(elevation)
