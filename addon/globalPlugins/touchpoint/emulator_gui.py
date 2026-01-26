@@ -297,22 +297,29 @@ class TouchpointEmulatorGUI:
         width, height = self.elevation_panel.GetSize()
         
         try:
-            # Create gradient image (grayscale from 0 to current_elevation)
-            gradient = np.linspace(0, int(self.current_elevation * 255), height, dtype=np.uint8)
-            gradient = np.tile(gradient.reshape(-1, 1), (1, width))
+            # Calculate how many pixels the elevation should fill (from bottom)
+            filled_height = int(self.current_elevation * height)
             
-            # Flip vertically so elevation fills from bottom
-            gradient = np.flipud(gradient)
+            # Create full gradient for entire height (255 at top to 0 at bottom)
+            # This way, as elevation rises, we reveal brighter colors
+            full_gradient = np.linspace(255, 0, height, dtype=np.uint8)
+            full_gradient = np.tile(full_gradient.reshape(-1, 1), (1, width))
             
-            # Apply colormap
-            colored = cv2.applyColorMap(gradient, self.colormap_cv2)
+            # Apply colormap to the full gradient
+            colored_full = cv2.applyColorMap(full_gradient, self.colormap_cv2)
+            colored_rgb_full = cv2.cvtColor(colored_full, cv2.COLOR_BGR2RGB)
             
-            # Convert BGR to RGB for wx
-            colored_rgb = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+            # Start with a white background
+            image_array = np.ones((height, width, 3), dtype=np.uint8) * 255
+            
+            if filled_height > 0:
+                # Copy only the bottom portion of the gradient (the filled part)
+                # Take the bottom filled_height rows from the full gradient
+                image_array[height - filled_height:height, :, :] = colored_rgb_full[height - filled_height:height, :, :]
             
             # Convert to wx.Bitmap
             image = wx.Image(width, height)
-            image.SetData(colored_rgb.tobytes())
+            image.SetData(image_array.tobytes())
             bitmap = wx.Bitmap(image)
             dc.DrawBitmap(bitmap, 0, 0)
             
@@ -378,10 +385,11 @@ class TouchpointEmulatorGUI:
             # Resize to fit panel
             depth_resized = cv2.resize(depth_colored, (width, height), interpolation=cv2.INTER_NEAREST)
             
-            # Draw cursor crosshair in center
+            # Draw cursor crosshair in center (smaller and thinner)
             cy, cx = height // 2, width // 2
-            cv2.line(depth_resized, (0, cy), (width, cy), (0, 0, 255), 2)
-            cv2.line(depth_resized, (cx, 0), (cx, height), (0, 0, 255), 2)
+            crosshair_length = 10  # pixels from center
+            cv2.line(depth_resized, (cx - crosshair_length, cy), (cx + crosshair_length, cy), (0, 0, 255), 1)
+            cv2.line(depth_resized, (cx, cy - crosshair_length), (cx, cy + crosshair_length), (0, 0, 255), 1)
             
             # Convert BGR to RGB for wx
             depth_rgb = cv2.cvtColor(depth_resized, cv2.COLOR_BGR2RGB)
