@@ -40,6 +40,9 @@ class HardwareDriver:
         
         # Current elevation state
         self.elevation = 0.0
+        
+        # Maximum elevation speed (units per second, where 1 unit = full range)
+        self.max_elevation_speed = 2.0
     
     def initialize(self):
         """Initialize the hardware driver and establish communication."""
@@ -89,6 +92,10 @@ class HardwareDriver:
             
             # Send current status
             self._send_status_to_emulator()
+            
+            # Send max elevation speed if this is a new connection
+            if not was_connected:
+                self._send_elevation_speed_to_emulator()
         except Exception as e:
             logMessage(f"Error responding to emulator ping: {e}")
     
@@ -104,16 +111,50 @@ class HardwareDriver:
             self.udp_core.send_packet(pkt)
         except Exception as e:
             logMessage(f"Error sending status to emulator: {e}")
+    
+    def _send_elevation_speed_to_emulator(self):
+        """Send max elevation speed to emulator."""
+        if not self.udp or not self.emulator_connected:
+            return
+        
+        try:
+            pkt = self.udp_core.create_packet(self.H_ELEVATION_SPEED)
+            pkt.write_float(self.max_elevation_speed)
+            self.udp_core.send_packet(pkt)
+        except Exception as e:
+            logMessage(f"Error sending elevation speed to emulator: {e}")
+    
+    def _send_elevation_speed_to_hardware(self):
+        """Send max elevation speed to hardware."""
+        if not self.hardware_connected:
+            return
+        
+        try:
+            pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
+            pkt.write_float(self.max_elevation_speed)
+            # Make a guaranteed send
+            self.uart_core.send_packet(pkt, True)
+            logMessage(f"Sent max elevation speed to hardware: {self.max_elevation_speed} units/sec")
+        except Exception as e:
+            logMessage(f"Error sending elevation speed to hardware: {e}")
         
     def set_max_elevation_speed(self, speed):
         """Set the maximum elevation speed for the device."""
-        if not self.hardware_connected:
-            return
-        # Sends max elevation speed to device
-        pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
-        pkt.write_float(speed)
-        # Make a guaranteed send
-        self.uart_core.send_packet(pkt, True)
+        if self.hardware_connected:
+            # Sends max elevation speed to hardware
+            pkt = self.core.create_packet(self.H_ELEVATION_SPEED)
+            pkt.write_float(speed)
+            # Make a guaranteed send
+            self.core.send_packet(pkt, True)
+        
+        if self.emulator_connected:
+            # Send to emulator
+            try:
+                pkt = self.udp_core.create_packet(self.H_ELEVATION_SPEED)
+                pkt.write_float(speed)
+                self.udp_core.send_packet(pkt)
+            except Exception as e:
+                logMessage(f"Error sending elevation speed to emulator: {e}")
     
     def _wait_for_ping(self):
         """Wait for ping response from microcontroller."""
@@ -133,6 +174,10 @@ class HardwareDriver:
             pkt = self.uart_core.create_packet(self.H_PING)
             self.uart_core.send_packet(pkt)
             logMessage("Ping received from microcontroller")
+            
+            # Send max elevation speed to hardware
+            self._send_elevation_speed_to_hardware()
+            
             return True
         else:
             return False

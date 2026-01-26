@@ -33,21 +33,20 @@ class TouchpointEmulator:
     UDP_EMULATOR_PORT = 7421  # Port emulator listens on
     UDP_LOCALHOST = "127.0.0.1"
     
-    # Display constants
-    MAX_ELEVATION = 100.0
-    MAX_VIBRATION_AMPLITUDE = 1.0
-    
     def __init__(self, root):
         """Initialize the emulator."""
         self.root = root
         self.root.title("Touchpoint Hardware Emulator")
-        self.root.geometry("600x700")
+        self.root.geometry("600x900")
         self.root.resizable(False, False)
         
         # State variables
         self.addon_connected = False
         self.hardware_connected = False
         self.current_elevation = 0.0
+        self.target_elevation = 0.0
+        self.max_elevation_speed = 1.0  # units per second (1 unit = full range)
+        self.last_update_time = time.time()
         self.current_vibration_amplitude = 0.0
         self.current_vibration_frequency = 0.0
         self.vibration_end_time = 0
@@ -97,8 +96,8 @@ class TouchpointEmulator:
         hardware_frame = ttk.Frame(status_frame)
         hardware_frame.pack(fill=tk.X, pady=5)
         ttk.Label(hardware_frame, text="Physical Hardware:", width=20).pack(side=tk.LEFT)
-        self.hardware_status_label = ttk.Label(hardware_frame, text="Not Connected", 
-                                              foreground="orange", font=("Arial", 10, "bold"))
+        self.hardware_status_label = ttk.Label(hardware_frame, text="Disconnected", 
+                                              foreground="red", font=("Arial", 10, "bold"))
         self.hardware_status_label.pack(side=tk.LEFT)
         
         # Elevation Indicator Section
@@ -154,10 +153,12 @@ class TouchpointEmulator:
         try:
             self.udp = SongbirdUDP("Touchpoint Emulator")
             self.udp_core = self.udp.get_protocol()
+            self.udp_core.set_allow_out_of_order(False)
             
             # Register handlers for receiving commands
             self.udp_core.set_header_handler(self.H_PING, self._handle_ping)
             self.udp_core.set_header_handler(self.H_ELEVATION, self._handle_elevation)
+            self.udp_core.set_header_handler(self.H_ELEVATION_SPEED, self._handle_elevation_speed)
             self.udp_core.set_header_handler(self.H_VIBRATION, self._handle_vibration)
             self.udp_core.set_header_handler(self.H_STATUS, self._handle_status)
             
@@ -202,10 +203,19 @@ class TouchpointEmulator:
         """Handle elevation command from addon."""
         try:
             elevation = packet.read_float()
-            self.current_elevation = max(0.0, min(self.MAX_ELEVATION, elevation))
-            print(f"Received elevation: {self.current_elevation}")
+            self.target_elevation = elevation
+            print(f"Received target elevation: {self.target_elevation}")
         except Exception as e:
             print(f"Error handling elevation: {e}")
+    
+    def _handle_elevation_speed(self, packet):
+        """Handle elevation speed command from addon."""
+        try:
+            speed = packet.read_float()
+            self.max_elevation_speed = speed
+            print(f"Received max elevation speed: {self.max_elevation_speed} units/sec")
+        except Exception as e:
+            print(f"Error handling elevation speed: {e}")
     
     def _handle_vibration(self, packet):
         """Handle vibration command from addon."""
@@ -214,8 +224,9 @@ class TouchpointEmulator:
             frequency = packet.read_float()
             duration = packet.read_int16()
             
-            self.current_vibration_amplitude = max(0.0, min(self.MAX_VIBRATION_AMPLITUDE, amplitude))
-            self.current_vibration_frequency = max(0.0, frequency)
+           
+            self.current_vibration_amplitude = amplitude
+            self.current_vibration_frequency = frequency
             self.vibration_end_time = time.time() + (duration / 1000.0)
             
             print(f"Received vibration: amp={amplitude}, freq={frequency}Hz, dur={duration}ms")
@@ -244,10 +255,26 @@ class TouchpointEmulator:
         if self.hardware_connected:
             self.hardware_status_label.config(text="Connected", foreground="green")
         else:
-            self.hardware_status_label.config(text="Not Connected", foreground="orange")
+            self.hardware_status_label.config(text="Disconnected", foreground="red")
     
     def _update_display(self):
         """Periodic update of the display elements."""
+        current_time = time.time()
+        delta_time = current_time - self.last_update_time
+        self.last_update_time = current_time
+        
+        # Smoothly animate elevation towards target based on speed
+        if abs(self.target_elevation - self.current_elevation) > 0.01:
+            # Calculate max change for this frame (speed is in units/second, where 1 unit = 100%)
+            max_change = self.max_elevation_speed * delta_time
+            
+            # Move towards target
+            diff = self.target_elevation - self.current_elevation
+            if abs(diff) <= max_change:
+                self.current_elevation = self.target_elevation
+            else:
+                self.current_elevation += max_change if diff > 0 else -max_change
+        
         # Check if vibration has expired
         if time.time() > self.vibration_end_time:
             self.current_vibration_amplitude = 0.0
@@ -258,11 +285,6 @@ class TouchpointEmulator:
         
         # Update vibration display
         self._draw_vibration()
-        
-        # Check connection timeout
-        if self.addon_connected:
-            # Could implement timeout logic here if needed
-            pass
         
         # Schedule next update (60 FPS)
         self.root.after(16, self._update_display)
@@ -280,7 +302,7 @@ class TouchpointEmulator:
         canvas.create_rectangle(2, 2, width-2, height-2, outline="black", width=2)
         
         # Calculate water level height
-        water_height = (self.current_elevation / self.MAX_ELEVATION) * (height - 4)
+        water_height = (self.current_elevation) * (height - 4)
         
         # Draw water level (blue gradient)
         if water_height > 0:
@@ -288,27 +310,17 @@ class TouchpointEmulator:
             # Main water body
             canvas.create_rectangle(2, water_y, width-2, height-2, 
                                    fill="#4da6ff", outline="")
-            # Darker water at bottom
-            canvas.create_rectangle(2, height-2-min(20, water_height), width-2, height-2, 
-                                   fill="#0066cc", outline="")
-            
-            # Add wave effect at top
-            wave_points = []
-            for x in range(0, width, 10):
-                import math
-                y_offset = math.sin((x + time.time() * 100) / 20) * 3
-                wave_points.extend([x, water_y + y_offset])
-            if len(wave_points) >= 4:
-                canvas.create_line(wave_points, fill="#0066cc", width=2, smooth=True)
         
-        # Draw percentage markers
+        # Draw percentage markers (with padding to prevent cutoff)
         for i in range(0, 11):
             y = height - 2 - (i * 0.1 * (height - 4))
-            canvas.create_line(2, y, 12, y, fill="gray", width=1)
-            canvas.create_text(width - 30, y, text=f"{i*10}%", font=("Arial", 8))
+            # Clamp y to ensure text doesn't get cut off (text needs ~10px padding)
+            y_clamped = max(10, min(height - 10, y))
+            canvas.create_line(5, y, 15, y, fill="gray", width=1)
+            canvas.create_text(width - 35, y_clamped, text=f"{i*10}%", font=("Arial", 8), anchor="e")
         
         # Update value label
-        self.elevation_value_label.config(text=f"{self.current_elevation:.1f}%")
+        self.elevation_value_label.config(text=f"{self.current_elevation*100:.1f}%")
     
     def _draw_vibration(self):
         """Draw the vibration indicator (height=amplitude, color=frequency)."""
@@ -323,7 +335,7 @@ class TouchpointEmulator:
         canvas.create_rectangle(2, 2, width-2, height-2, outline="black", width=2)
         
         # Calculate vibration height based on amplitude
-        vib_height = (self.current_vibration_amplitude / self.MAX_VIBRATION_AMPLITUDE) * (height - 4)
+        vib_height = (self.current_vibration_amplitude) * (height - 4)
         
         # Determine color based on frequency (0-500 Hz mapped to red-yellow-green-blue spectrum)
         color = self._frequency_to_color(self.current_vibration_frequency)
@@ -343,11 +355,13 @@ class TouchpointEmulator:
                 canvas.create_rectangle(2, vib_y, width-2, vib_y + shimmer_height,
                                        fill="white", stipple="gray50")
         
-        # Draw amplitude markers
+        # Draw amplitude markers (with padding to prevent cutoff)
         for i in range(0, 11):
             y = height - 2 - (i * 0.1 * (height - 4))
-            canvas.create_line(2, y, 12, y, fill="gray", width=1)
-            canvas.create_text(width - 40, y, text=f"{i*0.1:.1f}", font=("Arial", 8))
+            # Clamp y to ensure text doesn't get cut off (text needs ~10px padding)
+            y_clamped = max(10, min(height - 10, y))
+            canvas.create_line(5, y, 15, y, fill="gray", width=1)
+            canvas.create_text(width - 45, y_clamped, text=f"{i*0.1:.1f}", font=("Arial", 8), anchor="e")
         
         # Update info labels
         self.vibration_amplitude_label.config(

@@ -198,6 +198,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                             image = self._capture_screen_region(camera, region)
                             
                             if image is not None:
+                                # Check if handler is still registered before calling callback
+                                with self.depth_map_lock:
+                                    if handler not in self.capture_regions:
+                                        continue  # Handler was removed, skip callback
+                                
                                 try:
                                     # Call the handler's callback with region and image
                                     handler.capture_callback(region, image)
