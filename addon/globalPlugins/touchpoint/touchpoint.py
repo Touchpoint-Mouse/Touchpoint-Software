@@ -17,7 +17,7 @@ import os
 import ctypes
 from .utils import logMessage, logUIElement
 from .handlers import HandlerManager, ObjectHandler
-from .handler_list import objectHandlerList, globalHandlerList
+from .handler_config import objectHandlerList, globalHandlerList
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
 

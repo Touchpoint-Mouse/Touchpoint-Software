@@ -47,10 +47,7 @@ class TouchpointEmulator:
         self.target_elevation = 0.0
         self.max_elevation_speed = 1.0  # units per second (1 unit = full range)
         self.last_update_time = time.time()
-        self.current_vibration_amplitude = 0.0
-        self.current_vibration_frequency = 0.0
-        self.vibration_end_time = 0
-        
+    
         # UDP components
         self.udp = None
         self.udp_core = None
@@ -102,15 +99,15 @@ class TouchpointEmulator:
         
         # Elevation Indicator Section
         elevation_frame = ttk.LabelFrame(main_frame, text="Elevation Level", padding="10")
-        elevation_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        elevation_frame.pack(fill=tk.BOTH, pady=(0, 10))
         
         # Elevation canvas (water level style)
         elevation_container = ttk.Frame(elevation_frame)
-        elevation_container.pack(fill=tk.BOTH, expand=True)
+        elevation_container.pack(fill=tk.X)
         
         self.elevation_canvas = tk.Canvas(elevation_container, width=560, height=200, 
                                          bg="white", relief=tk.SUNKEN, borderwidth=2)
-        self.elevation_canvas.pack(pady=5)
+        self.elevation_canvas.pack(pady=(0, 5))
         
         # Elevation value label
         self.elevation_value_label = ttk.Label(elevation_frame, text="0.0%", 
@@ -118,28 +115,30 @@ class TouchpointEmulator:
         self.elevation_value_label.pack()
         
         # Vibration Indicator Section
-        vibration_frame = ttk.LabelFrame(main_frame, text="Vibration Status", padding="10")
+        vibration_frame = ttk.LabelFrame(main_frame, text="Vibration Events", padding="10")
         vibration_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
         
-        # Vibration canvas (water level style with color)
-        vibration_container = ttk.Frame(vibration_frame)
-        vibration_container.pack(fill=tk.BOTH, expand=True)
+        # Vibration events log (scrollable)
+        log_frame = ttk.Frame(vibration_frame)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
         
-        self.vibration_canvas = tk.Canvas(vibration_container, width=560, height=200, 
-                                         bg="white", relief=tk.SUNKEN, borderwidth=2)
-        self.vibration_canvas.pack(pady=5)
+        # Create scrollable text widget
+        log_container = ttk.Frame(log_frame)
+        log_container.pack(fill=tk.BOTH, expand=True)
         
-        # Vibration info labels
-        info_frame = ttk.Frame(vibration_frame)
-        info_frame.pack()
+        self.vibration_log = tk.Text(log_container, height=6, width=60, 
+                                     font=("Courier", 9), wrap=tk.NONE,
+                                     bg="#f5f5f5", fg="#333333")
+        self.vibration_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        self.vibration_amplitude_label = ttk.Label(info_frame, text="Amplitude: 0.0", 
-                                                   font=("Arial", 11))
-        self.vibration_amplitude_label.pack()
+        # Add scrollbar
+        log_scrollbar = ttk.Scrollbar(log_container, orient=tk.VERTICAL, 
+                                     command=self.vibration_log.yview)
+        log_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.vibration_log.config(yscrollcommand=log_scrollbar.set)
         
-        self.vibration_frequency_label = ttk.Label(info_frame, text="Frequency: 0 Hz", 
-                                                   font=("Arial", 11))
-        self.vibration_frequency_label.pack()
+        # Make text widget read-only
+        self.vibration_log.config(state=tk.DISABLED)
         
         # UDP Info
         udp_frame = ttk.Frame(main_frame)
@@ -224,12 +223,27 @@ class TouchpointEmulator:
             frequency = packet.read_float()
             duration = packet.read_int16()
             
-           
-            self.current_vibration_amplitude = amplitude
-            self.current_vibration_frequency = frequency
-            self.vibration_end_time = time.time() + (duration / 1000.0)
+            # Add to event log
+            current_time = time.time()
+            timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
+            milliseconds = int((current_time % 1) * 1000)
+            timestamp_with_ms = f"{timestamp}.{milliseconds:03d}"
+            dur_str = "indefinite" if duration == 0 else f"{duration}pulses"
+            if (amplitude == 0.0 or frequency == 0.0):
+                log_entry = f"[{timestamp_with_ms}] Vibration stopped\n"
+            else:
+                log_entry = f"[{timestamp_with_ms}] Amp: {amplitude:.3f}  Freq: {frequency:6.1f}Hz  Dur: {dur_str}\n"
             
-            print(f"Received vibration: amp={amplitude}, freq={frequency}Hz, dur={duration}ms")
+            self.vibration_log.config(state=tk.NORMAL)
+            self.vibration_log.insert(tk.END, log_entry)
+            # Limit log to last 100 lines
+            lines = int(self.vibration_log.index('end-1c').split('.')[0])
+            if lines > 100:
+                self.vibration_log.delete('1.0', '2.0')
+            self.vibration_log.see(tk.END)  # Auto-scroll to bottom
+            self.vibration_log.config(state=tk.DISABLED)
+            
+            print(log_entry.strip())
         except Exception as e:
             print(f"Error handling vibration: {e}")
     
@@ -275,16 +289,8 @@ class TouchpointEmulator:
             else:
                 self.current_elevation += max_change if diff > 0 else -max_change
         
-        # Check if vibration has expired
-        if time.time() > self.vibration_end_time:
-            self.current_vibration_amplitude = 0.0
-            self.current_vibration_frequency = 0.0
-        
         # Update elevation display
         self._draw_elevation()
-        
-        # Update vibration display
-        self._draw_vibration()
         
         # Schedule next update (60 FPS)
         self.root.after(16, self._update_display)
@@ -321,84 +327,6 @@ class TouchpointEmulator:
         
         # Update value label
         self.elevation_value_label.config(text=f"{self.current_elevation*100:.1f}%")
-    
-    def _draw_vibration(self):
-        """Draw the vibration indicator (height=amplitude, color=frequency)."""
-        canvas = self.vibration_canvas
-        width = canvas.winfo_width() if canvas.winfo_width() > 1 else 560
-        height = canvas.winfo_height() if canvas.winfo_height() > 1 else 200
-        
-        # Clear canvas
-        canvas.delete("all")
-        
-        # Draw border
-        canvas.create_rectangle(2, 2, width-2, height-2, outline="black", width=2)
-        
-        # Calculate vibration height based on amplitude
-        vib_height = (self.current_vibration_amplitude) * (height - 4)
-        
-        # Determine color based on frequency (0-500 Hz mapped to red-yellow-green-blue spectrum)
-        color = self._frequency_to_color(self.current_vibration_frequency)
-        
-        # Draw vibration level
-        if vib_height > 0:
-            vib_y = height - 2 - vib_height
-            canvas.create_rectangle(2, vib_y, width-2, height-2, 
-                                   fill=color, outline="")
-            
-            # Add shimmer effect for active vibration
-            if self.current_vibration_amplitude > 0:
-                import math
-                shimmer_alpha = int(128 + 127 * math.sin(time.time() * 10))
-                # Create shimmer bar
-                shimmer_height = max(5, vib_height * 0.1)
-                canvas.create_rectangle(2, vib_y, width-2, vib_y + shimmer_height,
-                                       fill="white", stipple="gray50")
-        
-        # Draw amplitude markers (with padding to prevent cutoff)
-        for i in range(0, 11):
-            y = height - 2 - (i * 0.1 * (height - 4))
-            # Clamp y to ensure text doesn't get cut off (text needs ~10px padding)
-            y_clamped = max(10, min(height - 10, y))
-            canvas.create_line(5, y, 15, y, fill="gray", width=1)
-            canvas.create_text(width - 45, y_clamped, text=f"{i*0.1:.1f}", font=("Arial", 8), anchor="e")
-        
-        # Update info labels
-        self.vibration_amplitude_label.config(
-            text=f"Amplitude: {self.current_vibration_amplitude:.3f}"
-        )
-        self.vibration_frequency_label.config(
-            text=f"Frequency: {self.current_vibration_frequency:.0f} Hz"
-        )
-    
-    def _frequency_to_color(self, frequency):
-        """Convert frequency to a color (red=low, yellow, green, blue=high)."""
-        if frequency == 0:
-            return "#e0e0e0"  # Gray for no vibration
-        
-        # Map 0-500 Hz to color spectrum
-        freq_norm = min(frequency / 500.0, 1.0)
-        
-        if freq_norm < 0.33:
-            # Red to Yellow
-            ratio = freq_norm / 0.33
-            r = 255
-            g = int(255 * ratio)
-            b = 0
-        elif freq_norm < 0.66:
-            # Yellow to Green
-            ratio = (freq_norm - 0.33) / 0.33
-            r = int(255 * (1 - ratio))
-            g = 255
-            b = 0
-        else:
-            # Green to Blue
-            ratio = (freq_norm - 0.66) / 0.34
-            r = 0
-            g = int(255 * (1 - ratio))
-            b = int(255 * ratio)
-        
-        return f"#{r:02x}{g:02x}{b:02x}"
     
     def _on_close(self):
         """Handle window close event."""

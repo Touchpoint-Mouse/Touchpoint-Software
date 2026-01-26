@@ -12,6 +12,6 @@ objectHandlerList = [
 globalHandlerList = [
     ScreenBorderHandler(effects={
         'border_enter': ComboEffect([VibrationEffect(0.1, 200.0, 0), lambda effect, obj=None, **kwargs: logMessage("Mouse entered screen border")]),
-        'border_leave': ComboEffect([VibrationEffect(0.05, 100.0, 0), lambda effect, obj=None, **kwargs: logMessage("Mouse left screen border")])
+        'border_leave': ComboEffect([VibrationEffect(0, 0, 0), lambda effect, obj=None, **kwargs: logMessage("Mouse left screen border")])
     })
 ]
