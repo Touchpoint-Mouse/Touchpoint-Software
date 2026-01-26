@@ -33,7 +33,7 @@ CONFIG = _cleanup(
             "c": {
                 "name": "msvc",
                 "linker": r"link",
-                "version": "19.29.30159",
+                "version": "19.44.35222",
                 "commands": r"cl",
                 "args": r"",
                 "linker args": r"",
@@ -41,7 +41,7 @@ CONFIG = _cleanup(
             "cython": {
                 "name": "cython",
                 "linker": r"cython",
-                "version": "3.1.0",
+                "version": "3.2.4",
                 "commands": r"cython",
                 "args": r"",
                 "linker args": r"",
@@ -49,7 +49,7 @@ CONFIG = _cleanup(
             "c++": {
                 "name": "msvc",
                 "linker": r"link",
-                "version": "19.29.30159",
+                "version": "19.44.35222",
                 "commands": r"cl",
                 "args": r"",
                 "linker args": r"",
@@ -93,7 +93,7 @@ CONFIG = _cleanup(
             },
         },
         "Python Information": {
-            "path": r"C:\Users\runneradmin\AppData\Local\Temp\build-env-uyt7cnl5\Scripts\python.exe",
+            "path": r"C:\Users\runneradmin\AppData\Local\Temp\build-env-ex4m340m\Scripts\python.exe",
             "version": "3.11",
         },
         "SIMD Extensions": {

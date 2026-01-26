@@ -20,6 +20,7 @@ from .handlers import HandlerManager, ObjectHandler
 from .handler_config import objectHandlerList, globalHandlerList
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
+from .emulator_gui import TouchpointEmulatorGUI
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -44,6 +45,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.max_elevation_speed = 2.0 # units per second
         self.hardware = HardwareDriver()
         
+        # Emulator GUI
+        self.emulator_gui = TouchpointEmulatorGUI(self.hardware)
+        self.hardware.set_emulator_gui(self.emulator_gui)
+        
         # Object handler manager
         self.objectHandlers = HandlerManager(self)
         self.objectHandlers.populate(objectHandlerList)
@@ -59,11 +64,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # State variables
         self.curr_obj = None
         self.curr_obj_id = None
+        self.curr_obj_lock = threading.Lock()  # Lock for curr_obj access
+        
+        # Mouse position tracking (updated by event thread)
+        self.mouse_position = (0, 0)
+        self.mouse_position_lock = threading.Lock()
         
         # Capture callback system
         self.camera = None
         self.capture_regions = {}  # Dict mapping handler -> region
-        self.depth_map_lock = threading.Lock()
+        self.capture_regions_lock = threading.Lock()  # Lock for capture_regions
+        self.depth_map_lock = threading.Lock()  # Lock for depth map data
         
         # Get full screen size for border detection
         self.screen_size = (ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1))  # (SM_CXSCREEN, SM_CYSCREEN)
@@ -120,7 +131,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             logMessage(f"[ERROR] Handler {handler.__class__.__name__} has no capture_callback method")
             return
         
-        with self.depth_map_lock:
+        with self.capture_regions_lock:
             self.capture_regions[handler] = region
     
     def remove_capture_region(self, handler):
@@ -129,7 +140,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         Args:
             handler: The handler object to remove
         """
-        with self.depth_map_lock:
+        with self.capture_regions_lock:
             if handler in self.capture_regions:
                 del self.capture_regions[handler]
     
@@ -188,7 +199,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             while self.enabled:
                 try:
                     # Capture all registered regions
-                    with self.depth_map_lock:
+                    with self.capture_regions_lock:
                         regions_to_capture = list(self.capture_regions.items())  # Create copy to avoid lock issues
                     
                     if regions_to_capture:
@@ -199,7 +210,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                             
                             if image is not None:
                                 # Check if handler is still registered before calling callback
-                                with self.depth_map_lock:
+                                with self.capture_regions_lock:
                                     if handler not in self.capture_regions:
                                         continue  # Handler was removed, skip callback
                                 
@@ -253,9 +264,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             return None
         
     def get_mouse_position(self):
-        """Get the current mouse position as (x, y)."""
-        pos = winUser.getCursorPos()
-        return pos
+        """Get the current mouse position as (x, y).
+        
+        Returns the cached position updated by the event tracking thread.
+        """
+        with self.mouse_position_lock:
+            return self.mouse_position
     
     def get_screen_size(self):
         """Get the full screen size as (width, height)."""
@@ -267,6 +281,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         while self.enabled:
             # Get current mouse position using NVDA's winUser
             current_pos = winUser.getCursorPos()
+            
+            # Update mouse position variable with lock
+            with self.mouse_position_lock:
+                self.mouse_position = current_pos
                 
             # Check what object is under the mouse cursor
             mouse_obj = NVDAObjects.NVDAObject.objectFromPoint(current_pos[0], current_pos[1])
@@ -276,20 +294,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 # Gets unique id for object under mouse
                 mouse_id = self._get_object_id(mouse_obj)
                 
+                # Check previous object with lock
+                with self.curr_obj_lock:
+                    prev_obj = self.curr_obj
+                    prev_obj_id = self.curr_obj_id
+                
                 # If there is a valid previous object, compare by ID
-                if self.curr_obj:
-                    if mouse_id != self.curr_obj_id:
+                if prev_obj:
+                    if mouse_id != prev_obj_id:
                         # Call enter/leave handlers for object change
                         for handler in self.objectHandlers.handlers:
-                            if handler.matches(self.curr_obj):
-                                handler.handle_event('leave', self.curr_obj)
+                            if handler.matches(prev_obj):
+                                handler.handle_event('leave', prev_obj)
                         for handler in self.objectHandlers.handlers:
                             if handler.matches(mouse_obj):
                                 handler.handle_event('enter', mouse_obj)
                 
-                # Update current object and ID
-                self.curr_obj = mouse_obj
-                self.curr_obj_id = mouse_id
+                # Update current object and ID with lock
+                with self.curr_obj_lock:
+                    self.curr_obj = mouse_obj
+                    self.curr_obj_id = mouse_id
             
             # Run global handlers
             for handler in self.globalHandlers.handlers:
@@ -514,3 +538,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if handler.matches(obj):
                 handler.handle_event('documentLoadComplete', obj)
         nextHandler()
+    
+    # Script to open emulator GUI
+    def script_openEmulator(self, gesture):
+        """Open the hardware emulator GUI window."""
+        ui.message("Opening Touchpoint emulator")
+        self.emulator_gui.open_window()
+    
+    # NVDA will automatically bind NVDA+shift+e to this script
+    script_openEmulator.__doc__ = "Open Touchpoint hardware emulator"
+    
+    __gestures = {
+        "kb:NVDA+shift+e": "openEmulator",
+    }

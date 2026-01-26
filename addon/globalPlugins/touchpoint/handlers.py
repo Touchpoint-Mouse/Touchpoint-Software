@@ -133,6 +133,9 @@ class GraphicHandler(ObjectHandler):
         if self.INVERT == -1:
             map = 1.0 - map
             
+        # Scale by elevation scale
+        map = map * self.ELEVATION_SCALE
+            
         # Calculate relative position in the depth map
         mouse_pos = self.plugin.get_mouse_position()
         rel_x = int((mouse_pos[0] - region.left) * map.shape[1] / region.width)
@@ -142,14 +145,14 @@ class GraphicHandler(ObjectHandler):
         rel_x = max(0, min(map.shape[1] - 1, rel_x))
         rel_y = max(0, min(map.shape[0] - 1, rel_y))
         
-        # Get depth value
-        depth_value = map[rel_y, rel_x]
-        
-        # Calculate elevation command
-        elevation = depth_value * self.ELEVATION_SCALE
+        # Get elevation value
+        elevation = map[rel_y, rel_x]
         
         # Send elevation command to hardware
         self.plugin.hardware.send_elevation(elevation)
+        
+        # Update depth map in emulator GUI
+        self.plugin.hardware.update_depth_map(region, map, mouse_pos)
         
     def handle_event(self, event_name, obj, **kwargs):
         """Handle an event by calling the appropriate effect.
@@ -170,6 +173,8 @@ class GraphicHandler(ObjectHandler):
         elif event_name == 'leave':
             # Remove this handler's capture region from the plugin
             self.plugin.remove_capture_region(self)
+            # Cancel depth map in emulator
+            self.plugin.hardware.update_depth_map(None, None, (0,0))
         
         # Call base handler
         super().handle_event(event_name, obj, **kwargs)

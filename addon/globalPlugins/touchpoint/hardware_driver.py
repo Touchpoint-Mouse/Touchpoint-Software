@@ -1,8 +1,9 @@
 import time
 import threading
 
-from songbird import SongbirdUART, SongbirdUDP
+from songbird import SongbirdUART
 from .utils import logMessage
+from .dependencies import np
 
 class HardwareDriver:
     # Header definitions
@@ -10,16 +11,13 @@ class HardwareDriver:
     H_ELEVATION = 0x10
     H_ELEVATION_SPEED = 0x11
     H_VIBRATION = 0x20
-    H_STATUS = 0x30  # Status message to emulator only
     
     # Serial configuration
     SERIAL_PORT = "COM6"
     SERIAL_BAUD_RATE = 460800
     
-    # UDP configuration for emulator
-    UDP_ADDON_PORT = 7420  # Port addon listens on
-    UDP_EMULATOR_PORT = 7421  # Port emulator listens on
-    UDP_LOCALHOST = "127.0.0.1"
+    # Depth map window size (pixels around cursor)
+    DEPTH_MAP_WINDOW_SIZE = 50
     
     def __init__(self):
         # UART connection for hardware
@@ -27,134 +25,68 @@ class HardwareDriver:
         self.uart_core = self.uart.get_protocol()
         self.hardware_connected = False
         
-        # Checks for new UART connections with hardware
-        self.hardware_check_thread = None
-        
-        # UDP connection for emulator
-        self.udp = SongbirdUDP("Touchpoint NVDA Addon UDP")
-        self.udp_core = self.udp.get_protocol()
-        # Set up handler for receiving emulator pings
-        self.udp_core.set_header_handler(self.H_PING, self._handle_emulator_ping)
-        self.udp_running = False
-        self.emulator_connected = False
+        # Emulator GUI (will be set by plugin)
+        self.emulator_gui = None
+        self.emulator_gui_lock = threading.Lock()  # Lock for emulator_gui access
         
         # Current elevation state
         self.elevation = 0.0
+        self.elevation_lock = threading.Lock()  # Lock for elevation state
         
         # Maximum elevation speed (units per second, where 1 unit = full range)
         self.max_elevation_speed = 2.0
+        self.speed_lock = threading.Lock()  # Lock for speed access
     
     def initialize(self):
         """Initialize the hardware driver and establish communication."""
-        # Initialize UDP listener for emulator
-        self._initialize_udp()
-        
         if not self.uart.begin(self.SERIAL_PORT, self.SERIAL_BAUD_RATE):
             self.hardware_connected = False
-            logMessage("Hardware not connected, using emulator only if available")
+            logMessage("Hardware not connected")
         else:
             # Wait for device ping
             self.hardware_connected = self._wait_for_ping()
             if not self.hardware_connected:
                 logMessage("Hardware did not respond to ping")
         
-        # Send initial status to emulator
-        self._send_status_to_emulator()
+        # Update emulator GUI if available
+        with self.emulator_gui_lock:
+            if self.emulator_gui:
+                self.emulator_gui.set_hardware_status(self.hardware_connected)
+                self.emulator_gui.set_elevation_speed(self.max_elevation_speed)
         
-        return self.hardware_connected or self.emulator_connected
+        return self.hardware_connected
     
-    def _initialize_udp(self):
-        """Initialize UDP communication for emulator."""
-        try:
-            # Listen on addon port
-            if self.udp.listen(self.UDP_ADDON_PORT):
-                # Set default remote to emulator port
-                self.udp.set_remote(self.UDP_LOCALHOST, self.UDP_EMULATOR_PORT)
-                self.udp_running = True
-                logMessage(f"UDP listener started on port {self.UDP_ADDON_PORT}")
-            else:
-                logMessage("Failed to start UDP listener")
-        except Exception as e:
-            logMessage(f"UDP initialization error: {e}")
-            
-    def _handle_emulator_ping(self, packet):
-        """Handle ping from emulator."""
-        was_connected = self.emulator_connected
-        self.emulator_connected = True
+    def set_emulator_gui(self, emulator_gui):
+        """Set the emulator GUI reference.
         
-        if not was_connected:
-            logMessage("Emulator connected via UDP")
-        
-        # Send ping response
-        try:
-            pkt = self.udp_core.create_packet(self.H_PING)
-            self.udp_core.send_packet(pkt)
-            
-            # Send current status
-            self._send_status_to_emulator()
-            
-            # Send max elevation speed if this is a new connection
-            if not was_connected:
-                self._send_elevation_speed_to_emulator()
-        except Exception as e:
-            logMessage(f"Error responding to emulator ping: {e}")
-    
-    def _send_status_to_emulator(self):
-        """Send hardware connection status to emulator."""
-        if not self.udp or not self.emulator_connected:
-            return
-        
-        try:
-            pkt = self.udp_core.create_packet(self.H_STATUS)
-            # Write 1 if hardware connected, 0 if not
-            pkt.write_uint8(1 if self.hardware_connected else 0)
-            self.udp_core.send_packet(pkt)
-        except Exception as e:
-            logMessage(f"Error sending status to emulator: {e}")
-    
-    def _send_elevation_speed_to_emulator(self):
-        """Send max elevation speed to emulator."""
-        if not self.udp or not self.emulator_connected:
-            return
-        
-        try:
-            pkt = self.udp_core.create_packet(self.H_ELEVATION_SPEED)
-            pkt.write_float(self.max_elevation_speed)
-            self.udp_core.send_packet(pkt)
-        except Exception as e:
-            logMessage(f"Error sending elevation speed to emulator: {e}")
-    
-    def _send_elevation_speed_to_hardware(self):
-        """Send max elevation speed to hardware."""
-        if not self.hardware_connected:
-            return
-        
-        try:
-            pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
-            pkt.write_float(self.max_elevation_speed)
-            # Make a guaranteed send
-            self.uart_core.send_packet(pkt, True)
-            logMessage(f"Sent max elevation speed to hardware: {self.max_elevation_speed} units/sec")
-        except Exception as e:
-            logMessage(f"Error sending elevation speed to hardware: {e}")
+        Args:
+            emulator_gui: TouchpointEmulatorGUI instance
+        """
+        with self.emulator_gui_lock:
+            self.emulator_gui = emulator_gui
+            if emulator_gui:
+                emulator_gui.set_hardware_status(self.hardware_connected)
+                emulator_gui.set_elevation_speed(self.max_elevation_speed)
         
     def set_max_elevation_speed(self, speed):
         """Set the maximum elevation speed for the device."""
-        if self.hardware_connected:
-            # Sends max elevation speed to hardware
-            pkt = self.core.create_packet(self.H_ELEVATION_SPEED)
-            pkt.write_float(speed)
-            # Make a guaranteed send
-            self.core.send_packet(pkt, True)
+        with self.speed_lock:
+            self.max_elevation_speed = speed
         
-        if self.emulator_connected:
-            # Send to emulator
+        if self.hardware_connected:
+            # Send to hardware
             try:
-                pkt = self.udp_core.create_packet(self.H_ELEVATION_SPEED)
+                pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
                 pkt.write_float(speed)
-                self.udp_core.send_packet(pkt)
+                # Make a guaranteed send
+                self.uart_core.send_packet(pkt, True)
             except Exception as e:
-                logMessage(f"Error sending elevation speed to emulator: {e}")
+                logMessage(f"Error sending elevation speed to hardware: {e}")
+        
+        # Update emulator GUI
+        with self.emulator_gui_lock:
+            if self.emulator_gui:
+                self.emulator_gui.set_elevation_speed(speed)
     
     def _wait_for_ping(self):
         """Wait for ping response from microcontroller."""
@@ -176,7 +108,14 @@ class HardwareDriver:
             logMessage("Ping received from microcontroller")
             
             # Send max elevation speed to hardware
-            self._send_elevation_speed_to_hardware()
+            try:
+                with self.speed_lock:
+                    speed = self.max_elevation_speed
+                pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
+                pkt.write_float(speed)
+                self.uart_core.send_packet(pkt, True)
+            except Exception as e:
+                logMessage(f"Error sending elevation speed to hardware: {e}")
             
             return True
         else:
@@ -186,55 +125,94 @@ class HardwareDriver:
         """Send a vibration command to the device."""
         if self.hardware_connected:
             # Send to hardware
-            pkt = self.uart_core.create_packet(self.H_VIBRATION)
-            pkt.write_float(amplitude)
-            pkt.write_float(frequency)
-            pkt.write_int16(duration)
-            self.uart_core.send_packet(pkt)
+            try:
+                pkt = self.uart_core.create_packet(self.H_VIBRATION)
+                pkt.write_float(amplitude)
+                pkt.write_float(frequency)
+                pkt.write_int16(duration)
+                self.uart_core.send_packet(pkt)
+            except Exception as e:
+                logMessage(f"Error sending vibration to hardware: {e}")
         
-        if self.emulator_connected:
-            # Send to emulator
-            pkt = self.udp_core.create_packet(self.H_VIBRATION)
-            pkt.write_float(amplitude)
-            pkt.write_float(frequency)
-            pkt.write_int16(duration)
-            self.udp_core.send_packet(pkt)
+        # Update emulator GUI
+        with self.emulator_gui_lock:
+            if self.emulator_gui:
+                self.emulator_gui.set_vibration(amplitude, frequency, duration)
                    
     def send_elevation(self, elevation):
         """Send an elevation command to the device."""
         # Update current elevation state
-        self.elevation = elevation
+        with self.elevation_lock:
+            self.elevation = elevation
         
         if self.hardware_connected:
             # Send to hardware
-            pkt = self.uart_core.create_packet(self.H_ELEVATION)
-            pkt.write_float(elevation)
-            self.uart_core.send_packet(pkt)
+            try:
+                pkt = self.uart_core.create_packet(self.H_ELEVATION)
+                pkt.write_float(elevation)
+                self.uart_core.send_packet(pkt)
+            except Exception as e:
+                logMessage(f"Error sending elevation to hardware: {e}")
         
-        if self.emulator_connected:
-            # Send to emulator
-            pkt = self.udp_core.create_packet(self.H_ELEVATION)
-            pkt.write_float(elevation)
-            self.udp_core.send_packet(pkt)
+        # Update emulator GUI
+        with self.emulator_gui_lock:
+            if self.emulator_gui:
+                self.emulator_gui.set_elevation(elevation)
+    
+    def update_depth_map(self, region, depth_map, mouse_pos):
+        """Update the depth map display in emulator.
+        
+        Args:
+            region: Screen region (location object with left, top, width, height)
+            depth_map: Numpy array with normalized depth values (0-1)
+            mouse_pos: Tuple of (x, y) mouse position in screen coordinates
+        """
+        with self.emulator_gui_lock:
+            if not self.emulator_gui:
+                return
+            
+            if depth_map is None or region is None:
+                # Clear depth map in emulator
+                self.emulator_gui.update_depth_map(None)
+                return
+            
+            try:
+                # Calculate window around mouse in depth map coordinates
+                # Convert mouse position to relative coordinates in depth map
+                rel_x = int((mouse_pos[0] - region.left) * depth_map.shape[1] / region.width)
+                rel_y = int((mouse_pos[1] - region.top) * depth_map.shape[0] / region.height)
+                
+                # Clamp coordinates
+                rel_x = max(0, min(depth_map.shape[1] - 1, rel_x))
+                rel_y = max(0, min(depth_map.shape[0] - 1, rel_y))
+                
+                # Calculate window bounds in depth map coordinates
+                half_window = self.DEPTH_MAP_WINDOW_SIZE // 2
+                
+                # Add padding of half_window to each side of depth map
+                padded_depth_map = np.pad(depth_map, ((half_window, half_window), (half_window, half_window)), constant_values=0)
+                x_start = rel_x
+                x_end = rel_x + 2*half_window
+                y_start = rel_y
+                y_end = rel_y + 2*half_window
+                
+                # Extract window
+                window = padded_depth_map[y_start:y_end, x_start:x_end]
+                
+                # Update emulator
+                self.emulator_gui.update_depth_map(window)
+            except Exception as e:
+                logMessage(f"[ERROR] Failed to update depth map: {e}")
         
     def add_elevation_offset(self, offset):
         """Add an elevation offset to the current elevation."""
-        if not self.hardware_connected and not self.emulator_connected:
-            return
-        new_elevation = self.elevation + offset
+        with self.elevation_lock:
+            new_elevation = self.elevation + offset
         self.send_elevation(new_elevation)
     
         
     def terminate(self):
         """Terminate the hardware driver and close communication."""
-        # Close UDP
-        self.udp_running = False
-        if self.udp:
-            try:
-                self.udp.close()
-            except:
-                pass
-        
         # Close UART
         self.hardware_connected = False
         if self.uart:

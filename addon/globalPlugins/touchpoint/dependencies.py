@@ -10,9 +10,6 @@ sys.path.insert(0, module_path)
 
 import dependency_checker
 
-# Add parent directory to path to import songbird
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-
 # Expand dependencies path if available
 dependency_checker.expand_path()
 
