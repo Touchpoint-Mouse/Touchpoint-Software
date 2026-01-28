@@ -78,6 +78,11 @@ class TouchpointEmulatorGUI:
             # Build GUI
             self._build_gui()
             
+            # Sync hardware connection status from driver
+            if self.hardware_driver:
+                self.hardware_connected = self.hardware_driver.hardware_connected
+                self._update_connection_status()
+            
             # Handle window close
             self.frame.Bind(wx.EVT_CLOSE, self._on_close)
             
