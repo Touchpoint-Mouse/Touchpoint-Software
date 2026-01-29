@@ -156,28 +156,50 @@ class HardwareDriver:
             if self.emulator_gui:
                 self.emulator_gui.set_vibration(amplitude, frequency, duration)
                    
-    def send_elevation(self, elevation):
-        """Send an elevation command to the device."""
+    def send_elevation(self, elevation, priority=False):
+        """Send an elevation command to the device.
+        
+        Args:
+            elevation: Elevation value to send (0.0-1.0)
+            priority: If True, bypasses rate limiting and overrides pending commands
+        """
         # Update current elevation state
         with self.elevation_lock:
             self.elevation = elevation
         
         if self.hardware_connected:
-            # Rate limiting check
             current_time = time.time()
-            with self.send_time_lock:
-                if current_time - self.last_elevation_send_time < self.min_send_interval:
-                    # Skip send to prevent buffer overflow
-                    pass
-                else:
+            
+            if priority:
+                # Priority commands bypass rate limiting and override pending
+                with self.send_time_lock:
                     self.last_elevation_send_time = current_time
-                    # Send to hardware
-                    try:
-                        pkt = self.uart_core.create_packet(self.H_ELEVATION)
-                        pkt.write_float(elevation)
-                        self.uart_core.send_packet(pkt)
-                    except Exception as e:
-                        logMessage(f"Error sending elevation to hardware: {e}")
+                # Send immediately
+                try:
+                    pkt = self.uart_core.create_packet(self.H_ELEVATION)
+                    pkt.write_float(elevation)
+                    # Sends in guaranteed mode
+                    self.uart_core.send_packet(pkt, True)
+                except Exception as e:
+                    logMessage(f"Error sending priority elevation to hardware: {e}")
+            else:
+                # Rate limiting check for normal commands
+                with self.send_time_lock:
+                    if current_time - self.last_elevation_send_time < self.min_send_interval:
+                        # Skip send to prevent buffer overflow
+                        pass
+                    else:
+                        self.last_elevation_send_time = current_time
+                        # Send to hardware
+                        try:
+                            pkt = self.uart_core.create_packet(self.H_ELEVATION)
+                            pkt.write_float(elevation)
+                            self.uart_core.send_packet(pkt)
+                            # Clear priority pending after successful normal send
+                            with self.priority_elevation_lock:
+                                self.priority_elevation_pending = None
+                        except Exception as e:
+                            logMessage(f"Error sending elevation to hardware: {e}")
         
         # Update emulator GUI
         with self.emulator_gui_lock:
