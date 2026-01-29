@@ -36,6 +36,12 @@ class HardwareDriver:
         # Maximum elevation speed (units per second, where 1 unit = full range)
         self.max_elevation_speed = 2.0
         self.speed_lock = threading.Lock()  # Lock for speed access
+        
+        # Rate limiting for packet sends to prevent buffer overflow
+        self.last_elevation_send_time = 0
+        self.last_vibration_send_time = 0
+        self.min_send_interval = 0.02  # Minimum 20ms between sends (50 Hz max)
+        self.send_time_lock = threading.Lock()
     
     def initialize(self):
         """Initialize the hardware driver and establish communication."""
@@ -103,9 +109,12 @@ class HardwareDriver:
         
         if response:
             # Send response back to acknowledge ping
-            pkt = self.uart_core.create_packet(self.H_PING)
-            self.uart_core.send_packet(pkt)
-            logMessage("Ping received from microcontroller")
+            try:
+                pkt = self.uart_core.create_packet(self.H_PING)
+                self.uart_core.send_packet(pkt)
+                logMessage("Ping received from microcontroller")
+            except Exception as e:
+                logMessage(f"Error sending ping response to hardware: {e}")
             
             # Send max elevation speed to hardware
             try:
@@ -124,15 +133,23 @@ class HardwareDriver:
     def send_vibration(self, amplitude, frequency, duration):
         """Send a vibration command to the device."""
         if self.hardware_connected:
-            # Send to hardware
-            try:
-                pkt = self.uart_core.create_packet(self.H_VIBRATION)
-                pkt.write_float(amplitude)
-                pkt.write_float(frequency)
-                pkt.write_int16(duration)
-                self.uart_core.send_packet(pkt)
-            except Exception as e:
-                logMessage(f"Error sending vibration to hardware: {e}")
+            # Rate limiting check
+            current_time = time.time()
+            with self.send_time_lock:
+                if current_time - self.last_vibration_send_time < self.min_send_interval:
+                    # Skip send to prevent buffer overflow
+                    pass
+                else:
+                    self.last_vibration_send_time = current_time
+                    # Send to hardware
+                    try:
+                        pkt = self.uart_core.create_packet(self.H_VIBRATION)
+                        pkt.write_float(amplitude)
+                        pkt.write_float(frequency)
+                        pkt.write_int16(duration)
+                        self.uart_core.send_packet(pkt)
+                    except Exception as e:
+                        logMessage(f"Error sending vibration to hardware: {e}")
         
         # Update emulator GUI
         with self.emulator_gui_lock:
@@ -146,13 +163,21 @@ class HardwareDriver:
             self.elevation = elevation
         
         if self.hardware_connected:
-            # Send to hardware
-            try:
-                pkt = self.uart_core.create_packet(self.H_ELEVATION)
-                pkt.write_float(elevation)
-                self.uart_core.send_packet(pkt)
-            except Exception as e:
-                logMessage(f"Error sending elevation to hardware: {e}")
+            # Rate limiting check
+            current_time = time.time()
+            with self.send_time_lock:
+                if current_time - self.last_elevation_send_time < self.min_send_interval:
+                    # Skip send to prevent buffer overflow
+                    pass
+                else:
+                    self.last_elevation_send_time = current_time
+                    # Send to hardware
+                    try:
+                        pkt = self.uart_core.create_packet(self.H_ELEVATION)
+                        pkt.write_float(elevation)
+                        self.uart_core.send_packet(pkt)
+                    except Exception as e:
+                        logMessage(f"Error sending elevation to hardware: {e}")
         
         # Update emulator GUI
         with self.emulator_gui_lock:
