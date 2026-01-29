@@ -21,13 +21,12 @@ class TouchpointEmulatorGUI:
     # Display constants
     DEPTH_MAP_WINDOW_SIZE = 50  # pixels around cursor to show in depth map
     
-    def __init__(self, hardware_driver):
+    def __init__(self):
         """Initialize the emulator GUI.
         
         Args:
             hardware_driver: Reference to the HardwareDriver instance
         """
-        self.hardware_driver = hardware_driver
         self.frame = None
         self.is_open = False
         
@@ -56,12 +55,14 @@ class TouchpointEmulatorGUI:
         """
         self.colormap_cv2 = colormap_cv2
     
-    def open_window(self):
+    def open_window(self, hardware_status):
         """Open the emulator window (called from NVDA keybind)."""
         if self.is_open and self.frame:
             # Window already open, just bring to front
             self.frame.Raise()
             return
+        
+        self.hardware_connected = hardware_status
         
         # Create window in main thread using wx.CallAfter
         wx.CallAfter(self._create_window)
@@ -78,10 +79,8 @@ class TouchpointEmulatorGUI:
             # Build GUI
             self._build_gui()
             
-            # Sync hardware connection status from driver
-            if self.hardware_driver:
-                self.hardware_connected = self.hardware_driver.hardware_connected
-                self._update_connection_status()
+            # Update connection status label based on current hardware state
+            self._update_connection_status()
             
             # Handle window close
             self.frame.Bind(wx.EVT_CLOSE, self._on_close)

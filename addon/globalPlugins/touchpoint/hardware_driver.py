@@ -19,15 +19,17 @@ class HardwareDriver:
     # Depth map window size (pixels around cursor)
     DEPTH_MAP_WINDOW_SIZE = 50
     
-    def __init__(self):
+    def __init__(self, plugin):
+        self.plugin = plugin
         # UART connection for hardware
         self.uart = SongbirdUART("Touchpoint NVDA Addon")
         self.uart_core = self.uart.get_protocol()
         self.hardware_connected = False
         
-        # Emulator GUI (will be set by plugin)
-        self.emulator_gui = None
-        self.emulator_gui_lock = threading.Lock()  # Lock for emulator_gui access
+        # Hardware health checking thread
+        self.health_check_thread = None
+        self.health_check_running = False
+        self.health_check_sleep = 0.5
         
         # Current elevation state
         self.elevation = 0.0
@@ -43,7 +45,7 @@ class HardwareDriver:
         self.min_send_interval = 0.02  # Minimum 20ms between sends (50 Hz max)
         self.send_time_lock = threading.Lock()
     
-    def initialize(self):
+    def initialize(self, health_check=True):
         """Initialize the hardware driver and establish communication."""
         if not self.uart.begin(self.SERIAL_PORT, self.SERIAL_BAUD_RATE):
             self.hardware_connected = False
@@ -53,51 +55,30 @@ class HardwareDriver:
             self.hardware_connected = self._wait_for_ping()
             if not self.hardware_connected:
                 logMessage("Hardware did not respond to ping")
+            else:
+                # Send max elevation speed to hardware
+                self.set_max_elevation_speed(self.max_elevation_speed)
         
-        # Update emulator GUI if available
-        with self.emulator_gui_lock:
-            if self.emulator_gui:
-                self.emulator_gui.set_hardware_status(self.hardware_connected)
-                self.emulator_gui.set_elevation_speed(self.max_elevation_speed)
+        # Update emulator GUI hardware status if available
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.set_hardware_status(self.hardware_connected)
+            
+        # Start health check thread if not started
+        if health_check and not self.health_check_running:
+            self.health_check_running = True
+            self.health_check_thread = threading.Thread(target=self._health_check_loop, daemon=True)
+            self.health_check_thread.start()
         
         return self.hardware_connected
     
-    def set_emulator_gui(self, emulator_gui):
-        """Set the emulator GUI reference.
-        
-        Args:
-            emulator_gui: TouchpointEmulatorGUI instance
-        """
-        with self.emulator_gui_lock:
-            self.emulator_gui = emulator_gui
-            if emulator_gui:
-                emulator_gui.set_hardware_status(self.hardware_connected)
-                emulator_gui.set_elevation_speed(self.max_elevation_speed)
-        
-    def set_max_elevation_speed(self, speed):
-        """Set the maximum elevation speed for the device."""
-        with self.speed_lock:
-            self.max_elevation_speed = speed
-        
-        if self.hardware_connected:
-            # Send to hardware
-            try:
-                pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
-                pkt.write_float(speed)
-                # Make a guaranteed send
-                self.uart_core.send_packet(pkt, True)
-            except Exception as e:
-                logMessage(f"Error sending elevation speed to hardware: {e}")
-        
-        # Update emulator GUI
-        with self.emulator_gui_lock:
-            if self.emulator_gui:
-                self.emulator_gui.set_elevation_speed(speed)
-    
     def _wait_for_ping(self):
         """Wait for ping response from microcontroller."""
-        time.sleep(1)
+        time.sleep(self.health_check_sleep)
         self.uart_core.flush()
+        
+        # Send ping
+        self.uart_core.send_packet(self.uart_core.create_packet(self.H_PING))
+        
         logMessage("Waiting for ping from microcontroller...")
         
         response = None
@@ -107,28 +88,16 @@ class HardwareDriver:
             self.uart_core.flush()
             timeout_count += 1
         
-        if response:
-            # Send response back to acknowledge ping
-            try:
-                pkt = self.uart_core.create_packet(self.H_PING)
-                self.uart_core.send_packet(pkt)
-                logMessage("Ping received from microcontroller")
-            except Exception as e:
-                logMessage(f"Error sending ping response to hardware: {e}")
+        return response is not None
+    
+    def _health_check_loop(self):
+        """Background thread to periodically check hardware connection."""
+        while self.health_check_running:
+            time.sleep(self.health_check_sleep)
             
-            # Send max elevation speed to hardware
-            try:
-                with self.speed_lock:
-                    speed = self.max_elevation_speed
-                pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
-                pkt.write_float(speed)
-                self.uart_core.send_packet(pkt, True)
-            except Exception as e:
-                logMessage(f"Error sending elevation speed to hardware: {e}")
-            
-            return True
-        else:
-            return False
+            if not self.uart.is_open():
+                # Attempt to reopen port
+                self.initialize(health_check=False)
         
     def send_vibration(self, amplitude, frequency, duration):
         """Send a vibration command to the device."""
@@ -142,19 +111,31 @@ class HardwareDriver:
                 else:
                     self.last_vibration_send_time = current_time
                     # Send to hardware
-                    try:
-                        pkt = self.uart_core.create_packet(self.H_VIBRATION)
-                        pkt.write_float(amplitude)
-                        pkt.write_float(frequency)
-                        pkt.write_int16(duration)
-                        self.uart_core.send_packet(pkt)
-                    except Exception as e:
-                        logMessage(f"Error sending vibration to hardware: {e}")
-        
+                    pkt = self.uart_core.create_packet(self.H_VIBRATION)
+                    pkt.write_float(amplitude)
+                    pkt.write_float(frequency)
+                    pkt.write_int16(duration)
+                    self.uart_core.send_packet(pkt)
+                    
         # Update emulator GUI
-        with self.emulator_gui_lock:
-            if self.emulator_gui:
-                self.emulator_gui.set_vibration(amplitude, frequency, duration)
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.set_vibration(amplitude, frequency, duration)
+            
+    def set_max_elevation_speed(self, speed):
+        """Set the maximum elevation speed for the device."""
+        with self.speed_lock:
+            self.max_elevation_speed = speed
+        
+        if self.hardware_connected:
+            # Send to hardware
+            pkt = self.uart_core.create_packet(self.H_ELEVATION_SPEED)
+            pkt.write_float(speed)
+            # Make a guaranteed send
+            self.uart_core.send_packet(pkt, True)
+        
+        # Update emulator GUI if available
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.set_elevation_speed(speed)
                    
     def send_elevation(self, elevation, priority=False):
         """Send an elevation command to the device.
@@ -175,13 +156,10 @@ class HardwareDriver:
                 with self.send_time_lock:
                     self.last_elevation_send_time = current_time
                 # Send immediately
-                try:
-                    pkt = self.uart_core.create_packet(self.H_ELEVATION)
-                    pkt.write_float(elevation)
-                    # Sends in guaranteed mode
-                    self.uart_core.send_packet(pkt, True)
-                except Exception as e:
-                    logMessage(f"Error sending priority elevation to hardware: {e}")
+                pkt = self.uart_core.create_packet(self.H_ELEVATION)
+                pkt.write_float(elevation)
+                # Sends in guaranteed mode
+                self.uart_core.send_packet(pkt, True)
             else:
                 # Rate limiting check for normal commands
                 with self.send_time_lock:
@@ -191,20 +169,24 @@ class HardwareDriver:
                     else:
                         self.last_elevation_send_time = current_time
                         # Send to hardware
-                        try:
-                            pkt = self.uart_core.create_packet(self.H_ELEVATION)
-                            pkt.write_float(elevation)
-                            self.uart_core.send_packet(pkt)
-                            # Clear priority pending after successful normal send
-                            with self.priority_elevation_lock:
-                                self.priority_elevation_pending = None
-                        except Exception as e:
-                            logMessage(f"Error sending elevation to hardware: {e}")
+                        pkt = self.uart_core.create_packet(self.H_ELEVATION)
+                        pkt.write_float(elevation)
+                        self.uart_core.send_packet(pkt)
         
         # Update emulator GUI
-        with self.emulator_gui_lock:
-            if self.emulator_gui:
-                self.emulator_gui.set_elevation(elevation)
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.set_elevation(elevation)
+            
+    def add_elevation_offset(self, offset):
+        """Add an elevation offset to the current elevation."""
+        with self.elevation_lock:
+            new_elevation = self.elevation + offset
+        self.send_elevation(new_elevation)
+    
+    def get_current_elevation(self):
+        """Get the current elevation value."""
+        with self.elevation_lock:
+            return self.elevation
     
     def update_depth_map(self, region, depth_map, mouse_pos):
         """Update the depth map display in emulator.
@@ -214,56 +196,44 @@ class HardwareDriver:
             depth_map: Numpy array with normalized depth values (0-1)
             mouse_pos: Tuple of (x, y) mouse position in screen coordinates
         """
-        with self.emulator_gui_lock:
-            if not self.emulator_gui:
-                return
-            
-            if depth_map is None or region is None:
-                # Clear depth map in emulator
-                self.emulator_gui.update_depth_map(None)
-                return
-            
-            try:
-                # Calculate window around mouse in depth map coordinates
-                # Convert mouse position to relative coordinates in depth map
-                rel_x = int((mouse_pos[0] - region.left) * depth_map.shape[1] / region.width)
-                rel_y = int((mouse_pos[1] - region.top) * depth_map.shape[0] / region.height)
-                
-                # Clamp coordinates
-                rel_x = max(0, min(depth_map.shape[1] - 1, rel_x))
-                rel_y = max(0, min(depth_map.shape[0] - 1, rel_y))
-                
-                # Calculate window bounds in depth map coordinates
-                half_window = self.DEPTH_MAP_WINDOW_SIZE // 2
-                
-                # Add padding of half_window to each side of depth map
-                padded_depth_map = np.pad(depth_map, ((half_window, half_window), (half_window, half_window)), constant_values=0)
-                x_start = rel_x
-                x_end = rel_x + 2*half_window
-                y_start = rel_y
-                y_end = rel_y + 2*half_window
-                
-                # Extract window
-                window = padded_depth_map[y_start:y_end, x_start:x_end]
-                
-                # Update emulator
-                self.emulator_gui.update_depth_map(window)
-            except Exception as e:
-                logMessage(f"[ERROR] Failed to update depth map: {e}")
+        if not self.plugin.emulator_gui:
+            return
         
-    def add_elevation_offset(self, offset):
-        """Add an elevation offset to the current elevation."""
-        with self.elevation_lock:
-            new_elevation = self.elevation + offset
-        self.send_elevation(new_elevation)
-    
+        if depth_map is None or region is None:
+            # Clear depth map in emulator
+            self.plugin.emulator_gui.update_depth_map(None)
+            return
+        
+        # Calculate window around mouse in depth map coordinates
+        # Convert mouse position to relative coordinates in depth map
+        rel_x = int((mouse_pos[0] - region.left) * depth_map.shape[1] / region.width)
+        rel_y = int((mouse_pos[1] - region.top) * depth_map.shape[0] / region.height)
+        
+        # Clamp coordinates
+        rel_x = max(0, min(depth_map.shape[1] - 1, rel_x))
+        rel_y = max(0, min(depth_map.shape[0] - 1, rel_y))
+        
+        # Calculate window bounds in depth map coordinates
+        half_window = self.DEPTH_MAP_WINDOW_SIZE // 2
+        
+        # Add padding of half_window to each side of depth map
+        padded_depth_map = np.pad(depth_map, ((half_window, half_window), (half_window, half_window)), constant_values=0)
+        x_start = rel_x
+        x_end = rel_x + 2*half_window
+        y_start = rel_y
+        y_end = rel_y + 2*half_window
+        
+        # Extract window
+        window = padded_depth_map[y_start:y_end, x_start:x_end]
+        
+        # Update emulator
+        self.plugin.emulator_gui.update_depth_map(window)
         
     def terminate(self):
         """Terminate the hardware driver and close communication."""
+        # Stop health check thread
+        self.health_check_running = False
         # Close UART
         self.hardware_connected = False
         if self.uart:
-            try:
-                self.uart.close()
-            except:
-                pass
+            self.uart.close()

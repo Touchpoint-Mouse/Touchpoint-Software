@@ -43,11 +43,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         
         # Hardware configuration
         self.max_elevation_speed = 2.0 # units per second
-        self.hardware = HardwareDriver()
+        self.hardware = HardwareDriver(self)
         
         # Emulator GUI
-        self.emulator_gui = TouchpointEmulatorGUI(self.hardware)
-        self.hardware.set_emulator_gui(self.emulator_gui)
+        self.emulator_gui = TouchpointEmulatorGUI()
         
         # Object handler manager
         self.objectHandlers = HandlerManager(self)
@@ -543,7 +542,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def script_openEmulator(self, gesture):
         """Open the hardware emulator GUI window."""
         ui.message("Opening Touchpoint emulator")
-        self.emulator_gui.open_window()
+        self.emulator_gui.open_window(self.hardware.hardware_connected)
     
     # NVDA will automatically bind NVDA+shift+e to this script
     script_openEmulator.__doc__ = "Open Touchpoint hardware emulator"

@@ -8,6 +8,7 @@ Uses pyserial for serial port communication.
 import threading
 import serial
 import logging
+import time
 from typing import Optional
 
 from .istream import IStream
@@ -48,6 +49,9 @@ class SongbirdUART(IStream):
         Returns:
             True if successful, False otherwise
         """
+        # Clean up any existing connection first
+        self.close()
+        
         try:
             self.serial_port = serial.Serial(
                 port=port,
@@ -76,13 +80,15 @@ class SongbirdUART(IStream):
         Args:
             buffer: Bytes to write
         """
-        if not self.serial_port or not self.serial_port.is_open:
+        if not self.is_open():
             return
         
         try:
             self.serial_port.write(buffer)
         except serial.SerialException as e:
             logging.error(f"Error writing to serial port: {e}")
+            # Mark connection as inactive so is_open() returns False
+            self.async_active = False
 
     def close(self) -> None:
         """Close the serial port and stop read thread."""
@@ -93,9 +99,6 @@ class SongbirdUART(IStream):
                 self.serial_port.close()
             except serial.SerialException:
                 pass
-        
-        if self.read_thread and self.read_thread.is_alive():
-            self.read_thread.join(timeout=2.0)
 
     def is_open(self) -> bool:
         """
@@ -104,7 +107,7 @@ class SongbirdUART(IStream):
         Returns:
             True if open, False otherwise
         """
-        return self.serial_port is not None and self.serial_port.is_open
+        return self.serial_port is not None and self.serial_port.is_open and self.async_active
 
     def get_protocol(self) -> SongbirdCore:
         """
@@ -117,15 +120,20 @@ class SongbirdUART(IStream):
 
     def _read_loop(self) -> None:
         """Background thread for reading serial data."""
-        while self.async_active and self.serial_port and self.serial_port.is_open:
+        while self.is_open():
             try:
                 if self.serial_port.in_waiting > 0:
                     data = self.serial_port.read(self.serial_port.in_waiting)
                     if data:
                         self.protocol.parse_data(data)
+                else:
+                    # No data waiting, small sleep to avoid busy-waiting
+                    time.sleep(0.01)
             except serial.SerialException as e:
                 logging.error(f"Serial read error: {e}")
+                self.async_active = False
                 break
             except Exception as e:
                 logging.error(f"Unexpected error in read loop: {e}")
+                self.async_active = False
                 break
