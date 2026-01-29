@@ -117,9 +117,14 @@ class GraphicHandler(ObjectHandler):
     
     def __init__(self, filter=GraphicFilter(), effects=None):
         super().__init__(filter, effects)
+        self.is_active = False  # Track if handler is currently active (inside object)
         
     def capture_callback(self, region, image):
         """Callback function when an image region is captured."""
+        # Early exit if handler is not active (prevents race conditions on leave)
+        if not self.is_active:
+            return
+            
          # Convert to grayscale
         map = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
@@ -148,6 +153,10 @@ class GraphicHandler(ObjectHandler):
         # Get elevation value
         elevation = map[rel_y, rel_x]
         
+        # Double-check still active before sending (defense in depth)
+        if not self.is_active:
+            return
+        
         # Send elevation command to hardware
         self.plugin.hardware.send_elevation(elevation)
         
@@ -168,15 +177,19 @@ class GraphicHandler(ObjectHandler):
             if not hasattr(obj, 'location') or not obj.location:
                 return
         
+            # Mark handler as active BEFORE starting capture
+            self.is_active = True
             # Get the location
             self.plugin.add_capture_region(self, obj.location)
         elif event_name == 'leave':
+            # Mark handler as inactive FIRST to stop capture callbacks immediately
+            self.is_active = False
             # Remove this handler's capture region from the plugin
             self.plugin.remove_capture_region(self)
             # Cancel depth map in emulator
             self.plugin.hardware.update_depth_map(None, None, (0,0))
         
-        # Call base handler
+        # Call base handler (triggers effects)
         super().handle_event(event_name, obj, **kwargs)
 
 class ScreenBorderHandler(GlobalHandler):
