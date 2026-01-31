@@ -1,4 +1,5 @@
 import controlTypes
+import re
 from .utils import logMessage
 
 class ObjectFilter:
@@ -71,6 +72,19 @@ class ComboGlobalFilter(GlobalFilter):
     
 class GraphicFilter(ObjectFilter):
     IMAGE_ROLES = (controlTypes.Role.GRAPHIC, controlTypes.Role.IMAGEMAP)
+    IMAGE_REGEX = r'(image|graphic|picture|video|map|chart|graph|photo|snapshot|screenshot)'
+    
+    def checkString(self, string):
+        """Check if the given string matches image-related patterns.
+        
+        Args:
+            string: The string to check.
+        Returns:
+            bool: True if the string matches image-related patterns, False otherwise.
+        """
+        if not string:
+            return False
+        return re.search(self.IMAGE_REGEX, string, re.IGNORECASE) is not None
     
     """Filter to identify graphic-related NVDA objects."""
     def matches(self, plugin, obj):
@@ -85,33 +99,26 @@ class GraphicFilter(ObjectFilter):
         if not obj:
             return False
         
-        try:
-            role = obj.role if hasattr(obj, 'role') else None
-            if role is None:
-                return False
+        role = obj.role if hasattr(obj, 'role') else None
+        
+        # Check if role is image related
+        if role in self.IMAGE_ROLES:
+            return True
+        
+        # Also check IAccessible and IAccessible2 attributes if available
+        ia_attrs = None
+        if hasattr(obj, 'IA2Attributes'):
+            ia_attrs = obj.IA2Attributes
+        elif hasattr(obj, 'IAccessibleObject') and hasattr(obj.IAccessibleObject, 'attributes'):
+            ia_attrs = obj.IAccessibleObject.attributes
             
-            # Check if role is GRAPHIC or IMAGEMAP
-            is_img = role in self.IMAGE_ROLES
-            
-            # Also check for video tags in IAccessible2 attributes
-            if not is_img:
-                # Try different attribute properties
-                ia2_attrs = None
-                if hasattr(obj, 'IA2Attributes'):
-                    ia2_attrs = obj.IA2Attributes
-                elif hasattr(obj, 'IAccessibleObject') and hasattr(obj.IAccessibleObject, 'attributes'):
-                    ia2_attrs = obj.IAccessibleObject.attributes
-                
-                if ia2_attrs:
-                    # IA2Attributes can be a dict or a string
-                    if isinstance(ia2_attrs, dict):
-                        if ia2_attrs.get('tag') == 'video':
-                            is_img = True
-                    elif isinstance(ia2_attrs, str):
-                        if 'tag:video' in ia2_attrs:
-                            is_img = True
-            
-            return is_img
-        except Exception as e:
-            logMessage(f"[DEBUG] Error checking if image: {e}")
-            return False
+        if ia_attrs:
+            # Attributes can be a dict or a string
+            if isinstance(ia_attrs, dict):
+                # Check all values in the dict
+                for value in ia_attrs.values():
+                    if self.checkString(value):
+                        return True
+            elif isinstance(ia_attrs, str) and self.checkString(ia_attrs):
+                return True
+        return False
