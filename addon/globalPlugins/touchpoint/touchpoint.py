@@ -286,7 +286,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 self.mouse_position = current_pos
                 
             # Check what object is under the mouse cursor
-            mouse_obj = NVDAObjects.NVDAObject.objectFromPoint(current_pos[0], current_pos[1])
+            try :
+                mouse_obj = NVDAObjects.NVDAObject.objectFromPoint(current_pos[0], current_pos[1])
+            except Exception as e:
+                mouse_obj = None
                 
             # Log IAccessible and IAccessible2 attributes for debugging
             if mouse_obj:
