@@ -229,6 +229,12 @@ class HardwareDriver:
         # Update emulator
         self.plugin.emulator_gui.update_depth_map(window)
         
+    def cycle_state(self):
+        """Cycle the hardware state machine. Should be called periodically."""
+        # For this simple driver, we don't have a complex state machine,
+        # but we can perform periodic tasks here if needed.
+        pass
+        
     def terminate(self):
         """Terminate the hardware driver and close communication."""
         # Stop health check thread

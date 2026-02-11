@@ -1,6 +1,14 @@
 from .utils import logMessage
+from .render_layers import CaptureLayer, SemanticLayer, DepthLayer, TextureLayer
 from .effects import ComboEffect, GlobalElevationEffect, VibrationEffect
 from .handlers import GraphicHandler, ScreenBorderHandler
+
+renderLayerList = [
+    CaptureLayer(),
+    SemanticLayer(),
+    DepthLayer(),
+    TextureLayer()
+]
 
 objectHandlerList = [
     GraphicHandler(effects={

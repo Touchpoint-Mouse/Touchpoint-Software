@@ -22,6 +22,26 @@ class HandlerManager:
         for handler in handler_list:
             self.add_handler(handler)
 
+class ObjectHandlerManager(HandlerManager):
+    def dispatch_event(self, event_name, obj, **kwargs):
+        """Dispatch an event to all matching handlers.
+        
+        Args:
+            event_name: The name of the event to dispatch
+            obj: The NVDA object associated with the event
+            **kwargs: Additional event-specific parameters
+        """
+        for handler in self.handlers:
+            if handler.matches(obj):
+                handler.handle_event(event_name, obj, **kwargs)
+
+class GlobalHandlerManager(HandlerManager):
+    def dispatch_events(self):
+        """Dispatch events for all active global handlers."""
+        for handler in self.handlers:
+            if handler.matches():
+                handler()
+
 class ObjectHandler:
     """Class to handle NVDA object-related events and interactions."""
     
@@ -108,6 +128,7 @@ class GlobalHandler:
                 logMessage(f"[ERROR] Effect '{event_name}' failed in {self.__class__.__name__}: {e}")
                 import traceback
                 logMessage(traceback.format_exc())
+        
 
 class GraphicHandler(ObjectHandler):
     """Class to handle image-related events and interactions."""
