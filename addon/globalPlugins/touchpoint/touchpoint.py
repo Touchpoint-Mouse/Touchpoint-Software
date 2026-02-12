@@ -17,11 +17,11 @@ import os
 import ctypes
 from .utils import logMessage, logUIElement
 from .handlers import ObjectHandlerManager, GlobalHandlerManager, ObjectHandler
-from .render_config import objectHandlerList, globalHandlerList, renderLayerList
+from .render_config import objectHandlerList, globalHandlerList, renderLayerList, rendererList
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
 from .emulator_gui import TouchpointEmulatorGUI
-from .render_layers import LayerManager
+from .render_layers import LayerManager, Region
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -57,12 +57,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.globalHandlers = GlobalHandlerManager(self)
         self.globalHandlers.populate(globalHandlerList)
         
-        # Layer manager
-        self.renderLayers = LayerManager(self)
-        self.renderLayers.populate(renderLayerList)
+        # Capture region configuration - centered on mouse with fixed size
+        self.capture_region_width = 100
+        self.capture_region_height = 100
         
-        # Initial region size
-        self.region_size = (100, 100)  # Default region size around cursor for depth map
+        # Create initial region
+        initial_region = Region(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
+        
+        # Render layers and renderers
+        self.renderLayers = renderLayerList
+        for layer in self.renderLayers:
+            layer.set_plugin(self)
+            layer.update_region_size(initial_region)
+            
+        self.renderers = rendererList
+        for renderer in self.renderers:
+            renderer.set_plugin(self)
         
         # Render thread
         self.render_thread = None
@@ -96,11 +106,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             
             # Set max elevation speed
             self.hardware.set_max_elevation_speed(self.max_elevation_speed)
-            
-            # Initialize render layers
-            for layer in self.renderLayers.layers.values():
-                layer.initialize()
-                layer.update_region_size(self.region_size)
             
             # Start render thread
             self.render_thread = threading.Thread(target=self._render_thread, daemon=True)
@@ -137,8 +142,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 # Update mouse position variable
                 self.mouse_position = current_pos
                 
-            # Update and render all layers
-            self.renderLayers.render_all_layers()
+            # Execute renderers in order
+            for renderer in self.renderers:
+                renderer()
             
             # Run global handlers
             self.globalHandlers.dispatch_events()
