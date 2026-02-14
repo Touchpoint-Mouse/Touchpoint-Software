@@ -43,14 +43,14 @@ class VibrationEffect(Effect):
         handler.plugin.hardware.send_vibration(self.amplitude, self.frequency, self.duration)
 
 class GlobalElevationEffect(Effect):
-    """ Effect to set the global elevation of the Touchpoint device. (overrides relative elevation) """
-    def __init__(self, elevation=0.0, priority=True):
+    """ Effect to set the global elevation of the Touchpoint device. """
+    def __init__(self, elevation=0.0, priority=0):
         """
         Initialize the GlobalElevationEffect.
         
         Args:
             elevation (float): Elevation value to set
-            priority (bool): If True, bypasses rate limiting and overrides depth-based commands
+            priority (int): Priority level for absolute elevation setting (0 = highest)
         """
         self.elevation = elevation
         self.priority = priority
@@ -60,7 +60,7 @@ class GlobalElevationEffect(Effect):
         handler.plugin.hardware.send_elevation(self.elevation, priority=self.priority)
         
 class RelativeElevationEffect(Effect):
-    """ Effect to set the relative elevation of the Touchpoint device. """
+    """ Effect to set the relative elevation of the Touchpoint device. Overidden by absolute elevation effects. """
     def __init__(self, offset=0.0):
         """
         Initialize the RelativeElevationEffect.
@@ -71,5 +71,5 @@ class RelativeElevationEffect(Effect):
         self.offset = offset
         
     def __call__(self, handler, obj=None, **kwargs):
-        """Execute the global elevation effect."""
+        """Execute the relative elevation effect."""
         handler.plugin.hardware.add_elevation_offset(self.offset)

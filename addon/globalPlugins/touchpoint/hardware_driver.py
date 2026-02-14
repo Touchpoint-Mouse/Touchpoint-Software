@@ -16,9 +16,6 @@ class HardwareDriver:
     SERIAL_PORT = "COM6"
     SERIAL_BAUD_RATE = 460800
     
-    # Depth map window size (pixels around cursor)
-    DEPTH_MAP_WINDOW_SIZE = 50
-    
     def __init__(self, plugin):
         self.plugin = plugin
         # UART connection for hardware
@@ -33,17 +30,16 @@ class HardwareDriver:
         
         # Current elevation state
         self.elevation = 0.0
+        # Sum of relative elevation offsets (for tracking cumulative relative changes)
+        self.relative_elevation_offset = 0.0
+        # Highest priority global elevation command (None if no command active)
+        # Format: (elevation_value, priority_level)
+        self.global_elevation_command = None
+        # Maximum elevation (units)
+        self.max_elevation = 180
+        # Maximum elevation speed (units per second)
+        self.max_elevation_speed = 255
         self.elevation_lock = threading.Lock()  # Lock for elevation state
-        
-        # Maximum elevation speed (units per second, where 1 unit = full range)
-        self.max_elevation_speed = 2.0
-        self.speed_lock = threading.Lock()  # Lock for speed access
-        
-        # Rate limiting for packet sends to prevent buffer overflow
-        self.last_elevation_send_time = 0
-        self.last_vibration_send_time = 0
-        self.min_send_interval = 0.02  # Minimum 20ms between sends (50 Hz max)
-        self.send_time_lock = threading.Lock()
     
     def initialize(self, health_check=True):
         """Initialize the hardware driver and establish communication."""
@@ -70,6 +66,15 @@ class HardwareDriver:
             self.health_check_thread.start()
         
         return self.hardware_connected
+    
+    def terminate(self):
+        """Terminate the hardware driver and close communication."""
+        # Stop health check thread
+        self.health_check_running = False
+        # Close UART
+        self.hardware_connected = False
+        if self.uart:
+            self.uart.close()
     
     def _wait_for_ping(self):
         """Wait for ping response from microcontroller."""
@@ -102,20 +107,12 @@ class HardwareDriver:
     def send_vibration(self, amplitude, frequency, duration):
         """Send a vibration command to the device."""
         if self.hardware_connected:
-            # Rate limiting check
-            current_time = time.time()
-            with self.send_time_lock:
-                if current_time - self.last_vibration_send_time < self.min_send_interval:
-                    # Skip send to prevent buffer overflow
-                    pass
-                else:
-                    self.last_vibration_send_time = current_time
-                    # Send to hardware
-                    pkt = self.uart_core.create_packet(self.H_VIBRATION)
-                    pkt.write_float(amplitude)
-                    pkt.write_float(frequency)
-                    pkt.write_int16(duration)
-                    self.uart_core.send_packet(pkt)
+            # Send to hardware
+            pkt = self.uart_core.create_packet(self.H_VIBRATION)
+            pkt.write_float(amplitude)
+            pkt.write_float(frequency)
+            pkt.write_int16(duration)
+            self.uart_core.send_packet(pkt)
                     
         # Update emulator GUI
         if self.plugin.emulator_gui:
@@ -123,7 +120,7 @@ class HardwareDriver:
             
     def set_max_elevation_speed(self, speed):
         """Set the maximum elevation speed for the device."""
-        with self.speed_lock:
+        with self.elevation_lock:
             self.max_elevation_speed = speed
         
         if self.hardware_connected:
@@ -136,110 +133,72 @@ class HardwareDriver:
         # Update emulator GUI if available
         if self.plugin.emulator_gui:
             self.plugin.emulator_gui.set_elevation_speed(speed)
+    
+    def set_max_elevation(self, elevation):
+        """Set the maximum elevation constraint for the device."""
+        with self.elevation_lock:
+            self.max_elevation = elevation
+        
+        # Update emulator GUI if available
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.set_max_elevation(elevation)
                    
-    def send_elevation(self, elevation, priority=False):
+    def set_global_elevation(self, elevation, priority=0):
         """Send an elevation command to the device.
         
         Args:
             elevation: Elevation value to send (0.0-1.0)
-            priority: If True, bypasses rate limiting and overrides pending commands
+            priority: Priority level of the command (higher values override lower ones)
         """
-        # Update current elevation state
         with self.elevation_lock:
-            self.elevation = elevation
-        
-        if self.hardware_connected:
-            current_time = time.time()
-            
-            if priority:
-                # Priority commands bypass rate limiting and override pending
-                with self.send_time_lock:
-                    self.last_elevation_send_time = current_time
-                # Send immediately
-                pkt = self.uart_core.create_packet(self.H_ELEVATION)
-                pkt.write_float(elevation)
-                # Sends in guaranteed mode
-                self.uart_core.send_packet(pkt, True)
+            # Update global elevation command if higher priority
+            if self.global_elevation_command is None or priority >= self.global_elevation_command[1]:
+                self.global_elevation_command = (elevation, priority)
             else:
-                # Rate limiting check for normal commands
-                with self.send_time_lock:
-                    if current_time - self.last_elevation_send_time < self.min_send_interval:
-                        # Skip send to prevent buffer overflow
-                        pass
-                    else:
-                        self.last_elevation_send_time = current_time
-                        # Send to hardware
-                        pkt = self.uart_core.create_packet(self.H_ELEVATION)
-                        pkt.write_float(elevation)
-                        self.uart_core.send_packet(pkt)
-        
-        # Update emulator GUI
-        if self.plugin.emulator_gui:
-            self.plugin.emulator_gui.set_elevation(elevation)
+                # Lower priority command ignored
+                return   
             
     def add_elevation_offset(self, offset):
         """Add an elevation offset to the current elevation."""
         with self.elevation_lock:
-            new_elevation = self.elevation + offset
-        self.send_elevation(new_elevation)
+            self.relative_elevation_offset += offset
     
     def get_current_elevation(self):
         """Get the current elevation value."""
         with self.elevation_lock:
             return self.elevation
     
-    def update_depth_map(self, region, depth_map, mouse_pos):
-        """Update the depth map display in emulator.
-        
-        Args:
-            region: Screen region (location object with left, top, width, height)
-            depth_map: Numpy array with normalized depth values (0-1)
-            mouse_pos: Tuple of (x, y) mouse position in screen coordinates
-        """
-        if not self.plugin.emulator_gui:
-            return
-        
-        if depth_map is None or region is None:
-            # Clear depth map in emulator
-            self.plugin.emulator_gui.update_depth_map(None)
-            return
-        
-        # Calculate window around mouse in depth map coordinates
-        # Convert mouse position to relative coordinates in depth map
-        rel_x = int((mouse_pos[0] - region.left) * depth_map.shape[1] / region.width)
-        rel_y = int((mouse_pos[1] - region.top) * depth_map.shape[0] / region.height)
-        
-        # Clamp coordinates
-        rel_x = max(0, min(depth_map.shape[1] - 1, rel_x))
-        rel_y = max(0, min(depth_map.shape[0] - 1, rel_y))
-        
-        # Calculate window bounds in depth map coordinates
-        half_window = self.DEPTH_MAP_WINDOW_SIZE // 2
-        
-        # Add padding of half_window to each side of depth map
-        padded_depth_map = np.pad(depth_map, ((half_window, half_window), (half_window, half_window)), constant_values=0)
-        x_start = rel_x
-        x_end = rel_x + 2*half_window
-        y_start = rel_y
-        y_end = rel_y + 2*half_window
-        
-        # Extract window
-        window = padded_depth_map[y_start:y_end, x_start:x_end]
-        
-        # Update emulator
-        self.plugin.emulator_gui.update_depth_map(window)
+    def get_max_elevation(self):
+        """Get the current maximum elevation constraint."""
+        with self.elevation_lock:
+            return self.max_elevation
         
     def cycle_state(self):
         """Cycle the hardware state machine. Should be called periodically."""
-        # For this simple driver, we don't have a complex state machine,
-        # but we can perform periodic tasks here if needed.
-        pass
+        # Determine effective elevation command
+        elevation = 0
+        with self.elevation_lock:
+            if self.global_elevation_command is not None:
+                # Use global elevation command
+                self.elevation = self.global_elevation_command[0]
+                
+            # Add relative elevation offset
+            self.elevation += self.relative_elevation_offset
+            # Clamp resulting elevation to valid range
+            self.elevation = max(0, min(self.max_elevation, self.elevation))
+            elevation = self.elevation
+            
+            # Reset relative elevation offset and global elevation command
+            self.relative_elevation_offset = 0.0
+            self.global_elevation_command = None
         
-    def terminate(self):
-        """Terminate the hardware driver and close communication."""
-        # Stop health check thread
-        self.health_check_running = False
-        # Close UART
-        self.hardware_connected = False
-        if self.uart:
-            self.uart.close()
+        # Send current elevation to hardware
+        if self.hardware_connected:
+            pkt = self.uart_core.create_packet(self.H_ELEVATION)
+            pkt.write_float(elevation)
+            self.uart_core.send_packet(pkt)
+        
+        # Update emulator GUI
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.set_elevation(elevation)
+        pass

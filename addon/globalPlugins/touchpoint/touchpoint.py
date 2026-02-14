@@ -16,12 +16,12 @@ import sys
 import os
 import ctypes
 from .utils import logMessage, logUIElement
-from .handlers import ObjectHandlerManager, GlobalHandlerManager, ObjectHandler
+from .handlers import ObjectHandlerManager, GlobalHandlerManager
 from .render_config import objectHandlerList, globalHandlerList, renderLayerList, rendererList
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
 from .emulator_gui import TouchpointEmulatorGUI
-from .render_layers import LayerManager, Region
+from .render_layers import Region
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -32,8 +32,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     for haptic feedback based on screen depth maps.
     """
     
-    # Mouse check interval
-    EVENT_CHECK_INTERVAL = 0.01
+    # Event checking and rendering interval
+    RENDER_INTERVAL = 0.01
     
     def __init__(self):
         """Initialize the global plugin."""
@@ -43,7 +43,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.enabled = True
         
         # Hardware configuration
-        self.max_elevation_speed = 2.0 # units per second
+        self.max_elevation_speed = 180 # units per second
         self.hardware = HardwareDriver(self)
         
         # Emulator GUI
@@ -107,6 +107,19 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Set max elevation speed
             self.hardware.set_max_elevation_speed(self.max_elevation_speed)
             
+            # Initialize renderers if needed (currently they are just data containers, but this is where setup would go)
+            for renderer in self.renderers:
+                renderer.initialize()
+            
+            # Initialize emulator with layer IDs and aspect ratio
+            layer_ids = [layer.id for layer in self.renderLayers]
+            aspect_ratio = self.capture_region_width / self.capture_region_height
+            self.emulator_gui.initialize_layers(layer_ids, aspect_ratio)
+            
+            # Initialize emulator with hardware settings
+            self.emulator_gui.set_max_elevation(self.hardware.get_max_elevation())
+            self.emulator_gui.set_elevation_speed(self.hardware.max_elevation_speed)
+            
             # Start render thread
             self.render_thread = threading.Thread(target=self._render_thread, daemon=True)
             self.render_thread.start()
@@ -145,13 +158,18 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Execute renderers in order
             for renderer in self.renderers:
                 renderer()
+                
+            # Update emulator with layer images if emulator is open
+            if self.emulator_gui.is_window_open():
+                for layer in self.renderLayers:
+                    self.emulator_gui.update_layer_image(layer.id, layer.image)
             
             # Run global handlers
             self.globalHandlers.dispatch_events()
                     
             # Cycle hardware state machine
             self.hardware.cycle_state()
-            time.sleep(self.EVENT_CHECK_INTERVAL)
+            time.sleep(self.RENDER_INTERVAL)
     
     def terminate(self):
         """Clean up when the plugin is terminated."""
@@ -364,6 +382,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def script_openEmulator(self, gesture):
         """Open the hardware emulator GUI window."""
         ui.message("Opening Touchpoint emulator")
+        
+        # Ensure emulator is initialized with latest layer info
+        layer_ids = [layer.id for layer in self.renderLayers]
+        aspect_ratio = self.capture_region_width / self.capture_region_height
+        self.emulator_gui.initialize_layers(layer_ids, aspect_ratio)
+        
+        # Update emulator with current hardware settings
+        self.emulator_gui.set_max_elevation(self.hardware.get_max_elevation())
+        self.emulator_gui.set_elevation_speed(self.hardware.max_elevation_speed)
+        
+        # Open the window
         self.emulator_gui.open_window(self.hardware.hardware_connected)
     
     # NVDA will automatically bind NVDA+shift+e to this script
