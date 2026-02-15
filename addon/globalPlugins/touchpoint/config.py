@@ -29,7 +29,9 @@ class TouchpointConfig:
         
         # Compute derived values (cached for performance)
         self.layer_dimensions = self._calculate_layer_dimensions()
-        self.capture_dimensions = self._calculate_capture_dimensions()
+        self.hardware_dimensions = self._calculate_hardware_dimensions()  # Hardware area without padding
+        self.capture_dimensions = self._calculate_capture_dimensions()  # Capture area with padding
+        self.capture_padding = self.software['capture_region'].get('padding', 0)
         
         # Log configuration summary
         self._log_configuration()
@@ -134,27 +136,45 @@ class TouchpointConfig:
         
         return dimensions
     
-    def _calculate_capture_dimensions(self):
-        """Calculate capture region dimensions from area and aspect ratio.
+    def _calculate_hardware_dimensions(self):
+        """Calculate hardware area dimensions (without padding) from area and hardware aspect ratio.
         
         Returns:
             tuple: (width, height) in pixels
         """
         capture_area = self.software['capture_region']['area']
-        capture_aspect_ratio = self.software['capture_region']['aspect_ratio']
+        hardware_aspect_ratio = self.hardware['display']['aspect_ratio']
         
         # area = width * height, aspect_ratio = width / height
         # height = sqrt(area / aspect_ratio), width = height * aspect_ratio
-        capture_height = int(math.sqrt(capture_area / capture_aspect_ratio))
-        capture_width = int(capture_height * capture_aspect_ratio)
+        hardware_height = int(math.sqrt(capture_area / hardware_aspect_ratio))
+        hardware_width = int(hardware_height * hardware_aspect_ratio)
+        
+        return (hardware_width, hardware_height)
+    
+    def _calculate_capture_dimensions(self):
+        """Calculate capture region dimensions with padding from area and aspect ratio.
+        
+        Returns:
+            tuple: (width, height) in pixels (includes padding on all sides)
+        """
+        hardware_width, hardware_height = self.hardware_dimensions
+        padding = self.software['capture_region'].get('padding', 0)
+        
+        # Add padding on all sides (left, right, top, bottom)
+        capture_width = hardware_width + (2 * padding)
+        capture_height = hardware_height + (2 * padding)
         
         return (capture_width, capture_height)
     
     def _log_configuration(self):
         """Log configuration summary for debugging."""
-        width, height = self.capture_dimensions
+        hw_width, hw_height = self.hardware_dimensions
+        cap_width, cap_height = self.capture_dimensions
+        padding = self.capture_padding
         logMessage(f"Configuration loaded:")
-        logMessage(f"  Capture region: {width}x{height} pixels (area={self.software['capture_region']['area']}, aspect={self.software['capture_region']['aspect_ratio']})")
+        logMessage(f"  Hardware area: {hw_width}x{hw_height} pixels (area={self.software['capture_region']['area']}, aspect={self.hardware['display']['aspect_ratio']})")
+        logMessage(f"  Capture region: {cap_width}x{cap_height} pixels (with {padding}px padding on all sides)")
         
         for layer_name, (w, h) in self.layer_dimensions.items():
             area = w * h

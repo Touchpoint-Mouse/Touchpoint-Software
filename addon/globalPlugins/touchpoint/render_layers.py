@@ -4,6 +4,7 @@ from .dependencies import np, cv2
 from .utils import logMessage
 import time
 from collections import namedtuple
+import NVDAObjects
 
 # Region definition for consistent region management
 Region = namedtuple('Region', ['left', 'top', 'width', 'height'])
@@ -125,24 +126,170 @@ class ObjectRenderer(Renderer):
         """
         self.capture_layer = capture_layer
         self.object_layer = object_layer
+    
+    def _is_duplicate(self, obj, existing_objects):
+        """Check if an object is a duplicate based on bounding box match.
+        
+        Args:
+            obj: NVDA object to check
+            existing_objects: List of objects already detected
+        Returns:
+            bool: True if object is a duplicate, False otherwise
+        """
+        try:
+            if not hasattr(obj, 'location') or obj.location is None:
+                return False
+                
+            obj_location = obj.location
+            
+            for obj_info in existing_objects:
+                existing_location = obj_info.get('location')
+                if existing_location is None:
+                    continue
+                    
+                if (existing_location.left == obj_location.left and
+                    existing_location.top == obj_location.top and
+                    existing_location.width == obj_location.width and
+                    existing_location.height == obj_location.height):
+                    return True  # Exact match of bounding box
+                    
+        except Exception as e:
+            logMessage(f"[ERROR] Duplicate checking failed: {e}")
+            
+        return False
         
     def __call__(self):
         """Find unique NVDA objects using a mesh grid and update layer image with object labels."""
-        # Get capture layer difference mask to determine which regions have changed
-        diff_mask = self.capture_layer.get_diff_mask()
-        if np.all(diff_mask == False):
-            return  # No changes, skip processing
-        
-        # Iterate through current semantic labels and check whether location boundaries intersect with changed regions in capture layer
-        # If so, update semantic layer labels for those regions
-        for label, info in self.object_layer.semantic_map.items():
-            pass
+        try:
+            # Save current object layer image at the beginning
+            current_image = self.object_layer.get_image()
             
-        # Get hardware resolution and convert to mesh dimensions
-        hardware_resolution = self.plugin.hardware.resolution
-        aspect_ratio = self.capture_layer.image.shape[1] / self.capture_layer.image.shape[0]
-        mesh_height = int(self.capture_layer.image.shape[0] / math.sqrt(hardware_resolution/aspect_ratio))
-        mesh_width = int(self.capture_layer.image.shape[1] / mesh_height*aspect_ratio)
+            # Get capture layer difference mask to determine which regions have changed
+            diff_mask = self.capture_layer.get_diff_mask()
+            if diff_mask.size == 0 or np.all(diff_mask == False):
+                return  # No changes, skip processing
+            
+            # Get current capture region
+            region = self.capture_layer.current_region
+            
+            # Get object mesh dimensions from config
+            if not self.plugin or not hasattr(self.plugin, 'config'):
+                return
+                
+            mesh_dims = self.plugin.config.layer_dimensions.get('object_mesh')
+            if mesh_dims is None:
+                return
+                
+            mesh_width, mesh_height = mesh_dims
+            
+            # Work on a copy of the image
+            new_image = current_image.copy()
+            
+            # Invalidate semantic labels that intersect with changed regions
+            labels_to_remove = []
+            for label, obj_info in self.object_layer.semantic_map.items():
+                location = obj_info.get('location')
+                if location is None:
+                    continue
+                
+                # Convert object location to capture-layer-relative coordinates
+                obj_left = location.left - region.left
+                obj_top = location.top - region.top
+                obj_right = obj_left + location.width
+                obj_bottom = obj_top + location.height
+                
+                # Check if object bounding box intersects with changed regions
+                # Clamp to image bounds
+                img_height, img_width = diff_mask.shape[:2]
+                obj_left = max(0, min(obj_left, img_width))
+                obj_top = max(0, min(obj_top, img_height))
+                obj_right = max(0, min(obj_right, img_width))
+                obj_bottom = max(0, min(obj_bottom, img_height))
+                
+                # Check if any pixels in the object region have changed
+                if obj_right > obj_left and obj_bottom > obj_top:
+                    object_region_mask = diff_mask[int(obj_top):int(obj_bottom), int(obj_left):int(obj_right)]
+                    if object_region_mask.size > 0 and np.any(object_region_mask):
+                        labels_to_remove.append(label)
+            
+            # Remove invalidated labels from semantic map and clear from working image
+            for label in labels_to_remove:
+                self.object_layer.remove_label(label)
+            
+            # Create mesh grid for object detection
+            # Generate evenly spaced points across the capture region (excluding endpoints to stay in bounds)
+            x_points = np.linspace(region.left, region.left + region.width - 1, mesh_width, dtype=int)
+            y_points = np.linspace(region.top, region.top + region.height - 1, mesh_height, dtype=int)
+            
+            # Get list of existing objects for duplicate checking
+            existing_objects = list(self.object_layer.semantic_map.values())
+            
+            # Loop through mesh grid and detect unique objects
+            for y in y_points:
+                for x in x_points:
+                    # Continue if this point already has a label in the working image (skip to next point)
+                    y_rel = y - region.top
+                    x_rel = x - region.left
+                    if new_image[y_rel, x_rel] != 0:
+                        continue
+                    try:
+                        # Get NVDA object at this screen position
+                        obj = NVDAObjects.NVDAObject.objectFromPoint(int(x), int(y))
+                        
+                        # Skip if no object or object has no location (can't label it)
+                        if obj is None or not hasattr(obj, 'location') or obj.location is None:
+                            continue
+                        
+                        # Skip if any of the object's dimensions are smaller than the mesh grid cell size (to avoid labeling tiny objects that won't be reliably detected)
+                        if obj.location.width < region.width / mesh_width or obj.location.height < region.height / mesh_height:
+                            continue
+                        
+                        # Check if this object is a duplicate of an already known object
+                        if self._is_duplicate(obj, existing_objects):
+                            # Duplicate of existing object - skip it
+                            continue
+                        
+                        # Add to semantic map
+                        obj_info = {
+                            'name': obj.name if hasattr(obj, 'name') else 'Unknown',
+                            'role': obj.role if hasattr(obj, 'role') else None,
+                            'location': obj.location if hasattr(obj, 'location') else None,
+                            'object': obj  # Keep reference for handlers
+                        }
+                        existing_objects.append(obj_info)
+                        new_label = self.object_layer.add_label(obj_info)
+                        
+                        # Fill object region with label immediately
+                        if hasattr(obj, 'location') and obj.location is not None:
+                            location = obj.location
+                            
+                            # Convert to capture-layer-relative coordinates
+                            obj_left = location.left - region.left
+                            obj_top = location.top - region.top
+                            obj_width = location.width
+                            obj_height = location.height
+                            
+                            # Clamp to image bounds
+                            img_height, img_width = new_image.shape[:2]
+                            x1 = max(0, min(int(obj_left), img_width))
+                            y1 = max(0, min(int(obj_top), img_height))
+                            x2 = max(0, min(int(obj_left + obj_width), img_width))
+                            y2 = max(0, min(int(obj_top + obj_height), img_height))
+                            
+                            # Fill object region with label
+                            if x2 > x1 and y2 > y1:
+                                new_image[y1:y2, x1:x2] = new_label
+                                
+                    except Exception as e:
+                        # Silently skip points that fail - common for invalid screen positions
+                        pass
+            
+            # Update the layer image atomically at the end
+            self.object_layer.update_image(new_image)
+                        
+        except Exception as e:
+            logMessage(f"[ERROR] ObjectRenderer failed: {e}")
+        
 
 class DepthRenderer(Renderer):
     """Renderer that computes depth map from capture layer and writes to depth layer."""
@@ -164,6 +311,14 @@ class DepthRenderer(Renderer):
             capture_img = self.capture_layer.get_image()
             if capture_img.size == 0:
                 return
+            
+            # Get padding from config
+            padding = self.plugin.config.capture_padding
+            
+            # Crop to hardware area (remove padding on all sides)
+            if padding > 0:
+                h, w = capture_img.shape[:2]
+                capture_img = capture_img[padding:h-padding, padding:w-padding]
             
             # Simple depth map: convert to grayscale and normalize
             # In a real implementation, this would use stereo vision or other depth estimation
@@ -436,8 +591,31 @@ class RenderLayer:
     
 class SemanticLayer(RenderLayer):
     """Render layer that stores semantic segmentation labels for each pixel."""
-    def __init__(self, id, constant_size=True):
+    def __init__(self, id, constant_size=None):
         super().__init__(id, dtype=np.uint8, constant_size=constant_size)
         # Map for semantic information based on pixel value
         self.semantic_map = {}
+        # Next label to assign for new objects (start from 1 since 0 is background)
+        self.next_label = 1
+        
+    def remove_label(self, label):
+        """Remove a label from the semantic map."""
+        if label in self.semantic_map:
+            del self.semantic_map[label]
+            with self.image_lock:
+                # Clear pixels with this label (set to 0) in working image
+                self.image[self.image == label] = 0
+    
+    def add_label(self, obj_info):
+        """Add a new object label to the semantic map.
+        
+        Args:
+            obj_info: Dictionary containing object information (name, role, location, etc.)
+        Returns:
+            int: The label assigned to this object
+        """
+        label = self.next_label
+        self.semantic_map[label] = obj_info
+        self.next_label += 1
+        return label
         

@@ -49,7 +49,7 @@ class RenderPipeline:
         layer_dims = self.config.layer_dimensions
         
         self.capture_layer = RenderLayer(id="capture", dtype=np.uint8)
-        self.object_layer = SemanticLayer(id="object")
+        self.object_layer = SemanticLayer(id="object", constant_size=None)  # Dynamic size follows capture region
         self.depth_layer = RenderLayer(id="depth", dtype=np.uint8, constant_size=layer_dims['depth'])
         self.texture_layer = RenderLayer(id="texture", dtype=np.uint8, constant_size=layer_dims['texture'])
         

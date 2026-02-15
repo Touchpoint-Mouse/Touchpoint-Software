@@ -1,9 +1,10 @@
 {
   "capture_region": {
     "area": 10000,
-    "aspect_ratio": 1.0
+    "padding": 15
   },
   "layer_multipliers": {
+    "object_mesh": 1.0,
     "depth": 4.0,
     "texture": 1.0
   }
