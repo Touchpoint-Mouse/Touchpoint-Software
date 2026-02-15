@@ -41,6 +41,8 @@ class CaptureRenderer(Renderer):
         self.layer = layer
         self.enabled = False
         self.camera_thread = None
+        self.capture_image = None
+        self.capture_lock = threading.Lock()
         
     def initialize(self):
         """Start camera thread. mss instance is created inside the thread."""
@@ -49,8 +51,10 @@ class CaptureRenderer(Renderer):
         self.camera_thread.start()
     
     def __call__(self):
-        """No-op for CaptureRenderer since capture runs in separate thread."""
-        pass
+        """Update the layer image with the latest captured screen region."""
+        with self.capture_lock:
+            if self.capture_image is not None:
+                self.layer.update_image(self.capture_image)
     
     def terminate(self):
         """Terminate the camera thread and release resources."""
@@ -110,7 +114,8 @@ class CaptureRenderer(Renderer):
                 
                 new_image[y_start:y_end, x_start:x_end] = frame
                 
-                self.layer.update_image(new_image)
+                with self.capture_lock:
+                    self.capture_image = new_image
             except Exception as e:
                 logMessage(f"[ERROR] CaptureRenderer failed: {e}")
                 time.sleep(0.01)  # Small delay to prevent excessive CPU usage
@@ -127,8 +132,8 @@ class ObjectRenderer(Renderer):
         self.capture_layer = capture_layer
         self.object_layer = object_layer
     
-    def _is_duplicate(self, obj, existing_objects):
-        """Check if an object is a duplicate based on bounding box match.
+    def _is_duplicate(self, obj, existing_objects, iou_threshold=0.8):
+        """Check if an object is a duplicate based on IoU (Intersection over Union).
         
         Args:
             obj: NVDA object to check
@@ -141,17 +146,45 @@ class ObjectRenderer(Renderer):
                 return False
                 
             obj_location = obj.location
+            obj_left = obj_location.left
+            obj_top = obj_location.top
+            obj_right = obj_left + obj_location.width
+            obj_bottom = obj_top + obj_location.height
+            obj_area = obj_location.width * obj_location.height
+            
+            if obj_area == 0:
+                return False
             
             for obj_info in existing_objects:
                 existing_location = obj_info.get('location')
                 if existing_location is None:
                     continue
+                
+                # Calculate intersection
+                ex_left = existing_location.left
+                ex_top = existing_location.top
+                ex_right = ex_left + existing_location.width
+                ex_bottom = ex_top + existing_location.height
+                ex_area = existing_location.width * existing_location.height
+                
+                if ex_area == 0:
+                    continue
+                
+                # Intersection rectangle
+                int_left = max(obj_left, ex_left)
+                int_top = max(obj_top, ex_top)
+                int_right = min(obj_right, ex_right)
+                int_bottom = min(obj_bottom, ex_bottom)
+                
+                # Check if there's any intersection
+                if int_right > int_left and int_bottom > int_top:
+                    int_area = (int_right - int_left) * (int_bottom - int_top)
+                    union_area = obj_area + ex_area - int_area
+                    iou = int_area / union_area if union_area > 0 else 0
                     
-                if (existing_location.left == obj_location.left and
-                    existing_location.top == obj_location.top and
-                    existing_location.width == obj_location.width and
-                    existing_location.height == obj_location.height):
-                    return True  # Exact match of bounding box
+                    # If IoU is high enough, consider it a duplicate
+                    if iou > iou_threshold:
+                        return True
                     
         except Exception as e:
             logMessage(f"[ERROR] Duplicate checking failed: {e}")
@@ -161,32 +194,40 @@ class ObjectRenderer(Renderer):
     def __call__(self):
         """Find unique NVDA objects using a mesh grid and update layer image with object labels."""
         try:
-            # Save current object layer image at the beginning
-            current_image = self.object_layer.get_image()
-            
             # Get capture layer difference mask to determine which regions have changed
             diff_mask = self.capture_layer.get_diff_mask()
-            if diff_mask.size == 0 or np.all(diff_mask == False):
+            
+            # Log for debugging
+            logMessage(f"[ObjectRenderer] diff_mask.size={diff_mask.size}, has_changes={np.any(diff_mask) if diff_mask.size > 0 else 'N/A'}")
+            
+            if diff_mask.size == 0 or not np.any(diff_mask):
+                logMessage("[ObjectRenderer] No changes detected, skipping object detection")
                 return  # No changes, skip processing
             
             # Get current capture region
             region = self.capture_layer.current_region
+            logMessage(f"[ObjectRenderer] Processing region: left={region.left}, top={region.top}, width={region.width}, height={region.height}")
             
             # Get object mesh dimensions from config
             if not self.plugin or not hasattr(self.plugin, 'config'):
+                logMessage("[ObjectRenderer] No plugin or config available")
                 return
                 
             mesh_dims = self.plugin.config.layer_dimensions.get('object_mesh')
             if mesh_dims is None:
+                logMessage("[ObjectRenderer] No object_mesh dimensions in config")
                 return
                 
             mesh_width, mesh_height = mesh_dims
+            logMessage(f"[ObjectRenderer] Mesh dimensions: {mesh_width}x{mesh_height}")
             
-            # Work on a copy of the image
-            new_image = current_image.copy()
+            # Get current object layer image to check which pixels belong to which objects
+            current_object_image = self.object_layer.get_image()
             
-            # Invalidate semantic labels that intersect with changed regions
+            # Invalidate objects whose actual pixels have changed in the diff_mask
             labels_to_remove = []
+            img_height, img_width = diff_mask.shape[:2]
+            
             for label, obj_info in self.object_layer.semantic_map.items():
                 location = obj_info.get('location')
                 if location is None:
@@ -198,23 +239,34 @@ class ObjectRenderer(Renderer):
                 obj_right = obj_left + location.width
                 obj_bottom = obj_top + location.height
                 
-                # Check if object bounding box intersects with changed regions
                 # Clamp to image bounds
-                img_height, img_width = diff_mask.shape[:2]
-                obj_left = max(0, min(obj_left, img_width))
-                obj_top = max(0, min(obj_top, img_height))
-                obj_right = max(0, min(obj_right, img_width))
-                obj_bottom = max(0, min(obj_bottom, img_height))
+                obj_left_clamped = max(0, min(obj_left, img_width))
+                obj_top_clamped = max(0, min(obj_top, img_height))
+                obj_right_clamped = max(0, min(obj_right, img_width))
+                obj_bottom_clamped = max(0, min(obj_bottom, img_height))
                 
-                # Check if any pixels in the object region have changed
-                if obj_right > obj_left and obj_bottom > obj_top:
-                    object_region_mask = diff_mask[int(obj_top):int(obj_bottom), int(obj_left):int(obj_right)]
-                    if object_region_mask.size > 0 and np.any(object_region_mask):
-                        labels_to_remove.append(label)
+                # If clamped region has zero size, object is completely outside bounds - remove it
+                if obj_right_clamped <= obj_left_clamped or obj_bottom_clamped <= obj_top_clamped:
+                    labels_to_remove.append(label)
+                    continue
+                
+                # Extract the bounding box region from both object layer and diff_mask
+                object_region = current_object_image[obj_top_clamped:obj_bottom_clamped, obj_left_clamped:obj_right_clamped]
+                diff_region = diff_mask[obj_top_clamped:obj_bottom_clamped, obj_left_clamped:obj_right_clamped]
+                
+                # Find pixels that belong to this specific object (where pixel value == label)
+                object_pixels_mask = (object_region == label)
+                
+                # Check if any of the object's actual pixels have changed in the diff_mask
+                if np.any(object_pixels_mask & diff_region):
+                    labels_to_remove.append(label)
             
-            # Remove invalidated labels from semantic map and clear from working image
+            # Remove invalidated labels from semantic map and clear from layer image
             for label in labels_to_remove:
                 self.object_layer.remove_label(label)
+            
+            # Now get working copy AFTER invalidation - it won't have the cleared pixels
+            new_image = self.object_layer.get_image()
             
             # Create mesh grid for object detection
             # Generate evenly spaced points across the capture region (excluding endpoints to stay in bounds)
@@ -224,29 +276,50 @@ class ObjectRenderer(Renderer):
             # Get list of existing objects for duplicate checking
             existing_objects = list(self.object_layer.semantic_map.values())
             
+            objects_detected = 0
+            points_checked = 0
+            points_already_labeled = 0
+            points_no_object = 0
+            points_no_location = 0
+            points_too_small = 0
+            points_duplicate = 0
+            points_exception = 0
+            
             # Loop through mesh grid and detect unique objects
             for y in y_points:
                 for x in x_points:
+                    points_checked += 1
                     # Continue if this point already has a label in the working image (skip to next point)
                     y_rel = y - region.top
                     x_rel = x - region.left
-                    if new_image[y_rel, x_rel] != 0:
+                    pixel_value = new_image[y_rel, x_rel]
+                    if np.any(pixel_value != 0):
+                        points_already_labeled += 1
                         continue
                     try:
                         # Get NVDA object at this screen position
                         obj = NVDAObjects.NVDAObject.objectFromPoint(int(x), int(y))
                         
                         # Skip if no object or object has no location (can't label it)
-                        if obj is None or not hasattr(obj, 'location') or obj.location is None:
+                        if obj is None:
+                            points_no_object += 1
+                            continue
+                        
+                        if not hasattr(obj, 'location') or obj.location is None:
+                            points_no_location += 1
                             continue
                         
                         # Skip if any of the object's dimensions are smaller than the mesh grid cell size (to avoid labeling tiny objects that won't be reliably detected)
-                        if obj.location.width < region.width / mesh_width or obj.location.height < region.height / mesh_height:
+                        cell_width = region.width / mesh_width
+                        cell_height = region.height / mesh_height
+                        if obj.location.width < cell_width or obj.location.height < cell_height:
+                            points_too_small += 1
+                            logMessage(f"[ObjectRenderer] Skipping small object at ({x},{y}): size={obj.location.width}x{obj.location.height}, cell_size={cell_width:.1f}x{cell_height:.1f}")
                             continue
                         
                         # Check if this object is a duplicate of an already known object
                         if self._is_duplicate(obj, existing_objects):
-                            # Duplicate of existing object - skip it
+                            points_duplicate += 1
                             continue
                         
                         # Add to semantic map
@@ -258,6 +331,21 @@ class ObjectRenderer(Renderer):
                         }
                         existing_objects.append(obj_info)
                         new_label = self.object_layer.add_label(obj_info)
+                        objects_detected += 1
+                        
+                        # Get role name for logging
+                        role_name = "Unknown"
+                        try:
+                            if hasattr(obj, 'role') and obj.role is not None:
+                                import controlTypes
+                                role_name = controlTypes.Role(obj.role).name if hasattr(controlTypes, 'Role') else str(obj.role)
+                        except:
+                            role_name = str(obj.role) if hasattr(obj, 'role') else "Unknown"
+                        
+                        # Get window class if available
+                        window_class = getattr(obj, 'windowClassName', '') if hasattr(obj, 'windowClassName') else ''
+                        
+                        logMessage(f"[ObjectRenderer] Detected object: label={new_label}, name='{obj_info['name']}', role={role_name}, class='{window_class}', location=({obj.location.left},{obj.location.top},{obj.location.width},{obj.location.height})")
                         
                         # Fill object region with label immediately
                         if hasattr(obj, 'location') and obj.location is not None:
@@ -276,16 +364,28 @@ class ObjectRenderer(Renderer):
                             x2 = max(0, min(int(obj_left + obj_width), img_width))
                             y2 = max(0, min(int(obj_top + obj_height), img_height))
                             
-                            # Fill object region with label
+                            # Fill object region with label (only unlabeled pixels to avoid overwriting existing labels)
                             if x2 > x1 and y2 > y1:
-                                new_image[y1:y2, x1:x2] = new_label
+                                region_slice = new_image[y1:y2, x1:x2]
+                                new_image[y1:y2, x1:x2] = np.where(region_slice == 0, new_label, region_slice)
                                 
                     except Exception as e:
-                        # Silently skip points that fail - common for invalid screen positions
-                        pass
+                        points_exception += 1
+                        logMessage(f"[ObjectRenderer] Exception at point ({x},{y}): {e}")
+            
+            logMessage(f"[ObjectRenderer] Detection summary:")
+            logMessage(f"  - Points checked: {points_checked}")
+            logMessage(f"  - Already labeled: {points_already_labeled}")
+            logMessage(f"  - No object: {points_no_object}")
+            logMessage(f"  - No location: {points_no_location}")
+            logMessage(f"  - Too small: {points_too_small}")
+            logMessage(f"  - Duplicate: {points_duplicate}")
+            logMessage(f"  - Exceptions: {points_exception}")
+            logMessage(f"  - Objects detected: {objects_detected}")
             
             # Update the layer image atomically at the end
             self.object_layer.update_image(new_image)
+            logMessage(f"[ObjectRenderer] Updated object layer image with {objects_detected} objects")
                         
         except Exception as e:
             logMessage(f"[ERROR] ObjectRenderer failed: {e}")
@@ -378,20 +478,20 @@ class ElevationRenderer(Renderer):
 class RenderLayer:
     """Simple data container for render layers."""
     
-    def __init__(self, id, dtype=np.uint8, constant_size=None):
+    def __init__(self, id, dtype=np.uint8, constant_size=None, num_channels=3):
         self.plugin = None
         self.id = id
         # constant_size can be:
         # - None or False: Dynamic size following region bounds
         # - Tuple (width, height): Fixed dimensions in pixels
         self.constant_size = constant_size
+        # Number of channels (1 for grayscale, 3 for BGR)
+        self.num_channels = num_channels
         
         # Render image
         self.image = np.array([], dtype=dtype)  # Placeholder for the rendered image data
         # Previous render image for diffing
         self.prev_image = np.array([], dtype=dtype)
-        # Lock for synchronizing access to the image
-        self.image_lock = threading.Lock()
         
         # Region tracking for relative bounds
         self.current_region = Region(0, 0, 0, 0)  # Current absolute screen region
@@ -399,8 +499,7 @@ class RenderLayer:
         
     def get_image(self):
         """Get the current rendered image with thread safety."""
-        with self.image_lock:
-            return self.image.copy()
+        return self.image.copy()
         
     def get_diff_mask(self):
         """Calculate and return the difference mask with thread safety.
@@ -412,69 +511,68 @@ class RenderLayer:
         Returns:
             Boolean array where True indicates pixels that need updating.
         """
-        with self.image_lock:
-            # If no current image, return empty mask
-            if self.image.size == 0:
-                return np.array([], dtype=bool)
+        # If no current image, return empty mask
+        if self.image.size == 0:
+            return np.array([], dtype=bool)
+        
+        # Get image dimensions
+        if len(self.image.shape) >= 2:
+            img_height, img_width = self.image.shape[:2]
+        else:
+            return np.ones((0, 0), dtype=bool)
+        
+        # If no previous image or regions not initialized, all pixels are "changed"
+        if self.prev_image.size == 0 or self.prev_region.width == 0 or self.current_region.width == 0:
+            return np.ones((img_height, img_width), dtype=bool)
+        
+        # Calculate relative offset between current and previous regions
+        dx = self.current_region.left - self.prev_region.left
+        dy = self.current_region.top - self.prev_region.top
+        
+        # Initialize diff mask (all True = all pixels are "changed")
+        diff_mask = np.ones((img_height, img_width), dtype=bool)
+        
+        # Calculate overlapping region to compare (pixels shift opposite to region movement)
+        # Source region in previous image (what to compare from)
+        src_x_start = max(0, dx)
+        src_y_start = max(0, dy)
+        src_x_end = min(self.prev_image.shape[1], self.prev_image.shape[1] + dx)
+        src_y_end = min(self.prev_image.shape[0], self.prev_image.shape[0] + dy)
+        
+        # Destination region in current image (what to compare to)
+        dst_x_start = max(0, -dx)
+        dst_y_start = max(0, -dy)
+        dst_x_end = min(img_width, img_width if dx <= 0 else img_width - dx)
+        dst_y_end = min(img_height, img_height if dy <= 0 else img_height - dy)
+        
+        # Ensure bounds are valid
+        src_width = src_x_end - src_x_start
+        src_height = src_y_end - src_y_start
+        dst_width = dst_x_end - dst_x_start
+        dst_height = dst_y_end - dst_y_start
+        
+        # Compare width/height is the minimum of source and destination
+        compare_width = min(src_width, dst_width)
+        compare_height = min(src_height, dst_height)
+        
+        if compare_width > 0 and compare_height > 0:
+            # Get overlapping regions from both images
+            prev_overlap = self.prev_image[src_y_start:src_y_start+compare_height,
+                                            src_x_start:src_x_start+compare_width]
+            curr_overlap = self.image[dst_y_start:dst_y_start+compare_height,
+                                        dst_x_start:dst_x_start+compare_width]
             
-            # Get image dimensions
-            if len(self.image.shape) >= 2:
-                img_height, img_width = self.image.shape[:2]
-            else:
-                return np.ones((0, 0), dtype=bool)
+            # Compare pixels - check if any channel differs
+            if len(self.image.shape) > 2:  # Multi-channel image
+                pixel_diff = np.any(prev_overlap != curr_overlap, axis=2)
+            else:  # Single-channel image
+                pixel_diff = prev_overlap != curr_overlap
             
-            # If no previous image or regions not initialized, all pixels are "changed"
-            if self.prev_image.size == 0 or self.prev_region.width == 0 or self.current_region.width == 0:
-                return np.ones((img_height, img_width), dtype=bool)
-            
-            # Calculate relative offset between current and previous regions
-            dx = self.current_region.left - self.prev_region.left
-            dy = self.current_region.top - self.prev_region.top
-            
-            # Initialize diff mask (all True = all pixels are "changed")
-            diff_mask = np.ones((img_height, img_width), dtype=bool)
-            
-            # Calculate overlapping region to compare
-            # Source region in previous image (what to compare from)
-            src_x_start = max(0, -dx)
-            src_y_start = max(0, -dy)
-            src_x_end = min(self.prev_image.shape[1], self.prev_image.shape[1] - dx)
-            src_y_end = min(self.prev_image.shape[0], self.prev_image.shape[0] - dy)
-            
-            # Destination region in current image (what to compare to)
-            dst_x_start = max(0, dx)
-            dst_y_start = max(0, dy)
-            dst_x_end = min(img_width, img_width if dx >= 0 else img_width + dx)
-            dst_y_end = min(img_height, img_height if dy >= 0 else img_height + dy)
-            
-            # Ensure bounds are valid
-            src_width = src_x_end - src_x_start
-            src_height = src_y_end - src_y_start
-            dst_width = dst_x_end - dst_x_start
-            dst_height = dst_y_end - dst_y_start
-            
-            # Compare width/height is the minimum of source and destination
-            compare_width = min(src_width, dst_width)
-            compare_height = min(src_height, dst_height)
-            
-            if compare_width > 0 and compare_height > 0:
-                # Get overlapping regions from both images
-                prev_overlap = self.prev_image[src_y_start:src_y_start+compare_height,
-                                               src_x_start:src_x_start+compare_width]
-                curr_overlap = self.image[dst_y_start:dst_y_start+compare_height,
-                                          dst_x_start:dst_x_start+compare_width]
-                
-                # Compare pixels - check if any channel differs
-                if len(self.image.shape) > 2:  # Multi-channel image
-                    pixel_diff = np.any(prev_overlap != curr_overlap, axis=2)
-                else:  # Single-channel image
-                    pixel_diff = prev_overlap != curr_overlap
-                
-                # Update diff mask for overlapping region
-                diff_mask[dst_y_start:dst_y_start+compare_height,
-                         dst_x_start:dst_x_start+compare_width] = pixel_diff
-            
-            return diff_mask.copy()
+            # Update diff mask for overlapping region
+            diff_mask[dst_y_start:dst_y_start+compare_height,
+                        dst_x_start:dst_x_start+compare_width] = pixel_diff
+        
+        return diff_mask.copy()
     
     def update_image(self, new_image):
         """Update the rendered image with thread safety.
@@ -484,23 +582,21 @@ class RenderLayer:
         Args:
             new_image: New image to set (will be resized if constant_size is set)
         """
-        with self.image_lock:
-            # If constant_size is set, resize the image to match
-            if self.constant_size:
-                target_width, target_height = self.constant_size
-                # Check if resize is needed
-                if new_image.shape[:2] != (target_height, target_width):
-                    # Resize using cv2 (import from dependencies)
-                    from .dependencies import cv2
-                    new_image = cv2.resize(new_image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
-            
-            self.image = new_image.copy()
+        # If constant_size is set, resize the image to match
+        if self.constant_size:
+            target_width, target_height = self.constant_size
+            # Check if resize is needed
+            if new_image.shape[:2] != (target_height, target_width):
+                # Resize using cv2 (import from dependencies)
+                from .dependencies import cv2
+                new_image = cv2.resize(new_image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+        
+        self.image = new_image.copy()
             
     def cycle_state(self):
         """Update the previous image and region to the current ones."""
-        with self.image_lock:
-            self.prev_image = self.image.copy()
-            self.prev_region = self.current_region
+        self.prev_image = self.image.copy()
+        self.prev_region = self.current_region
         
     def set_plugin(self, plugin):
         """Set the parent plugin for this layer."""
@@ -515,84 +611,84 @@ class RenderLayer:
         Args:
             new_region: Region namedtuple with (left, top, width, height) in screen coordinates
         """
-        with self.image_lock:
-            # Store old state
-            old_image = self.image.copy() if self.image.size > 0 else None
-            old_region = self.current_region
+        # Store old state
+        old_image = self.image.copy() if self.image.size > 0 else None
+        old_region = self.current_region
+        
+        # Update current region
+        self.current_region = new_region
+        
+        # Determine target image size
+        if self.constant_size:
+            # Use constant size (width, height tuple)
+            target_width, target_height = self.constant_size
+        elif old_image is not None and old_image.size > 0:
+            # For dynamic layers that already have an image, maintain size if it exists
+            # (This case shouldn't normally happen, but we handle it gracefully)
+            target_height, target_width = old_image.shape[:2]
+        else:
+            # Use new region size
+            target_width = new_region.width
+            target_height = new_region.height
+        
+        # Initialize new image and difference mask
+        if old_image is not None and old_image.size > 0:
+            dtype = old_image.dtype
+            num_channels = old_image.shape[2] if len(old_image.shape) > 2 else 1
+        else:
+            # Use stored dtype from layer initialization
+            dtype = self.image.dtype if hasattr(self, 'image') and self.image.dtype else np.uint8
+            # Use stored num_channels from layer initialization
+            num_channels = self.num_channels
+        
+        if num_channels > 1:
+            new_image = np.zeros((target_height, target_width, num_channels), dtype=dtype)
+        else:
+            new_image = np.zeros((target_height, target_width), dtype=dtype)
+        
+        # If we have an old image, copy overlapping region
+        if old_image is not None and old_image.size > 0:
+            # Calculate relative offset (how much the region moved)
+            dx = new_region.left - old_region.left
+            dy = new_region.top - old_region.top
             
-            # Update current region
-            self.current_region = new_region
+            # When region moves right, layer content shifts left (opposite direction)
+            # Source region in old image (what to copy from)
+            src_x_start = max(0, dx)
+            src_y_start = max(0, dy)
+            src_x_end = min(old_image.shape[1], old_image.shape[1] + dx)
+            src_y_end = min(old_image.shape[0], old_image.shape[0] + dy)
             
-            # Determine target image size
-            if self.constant_size:
-                # Use constant size (width, height tuple)
-                target_width, target_height = self.constant_size
-            elif old_image is not None and old_image.size > 0:
-                # For dynamic layers that already have an image, maintain size if it exists
-                # (This case shouldn't normally happen, but we handle it gracefully)
-                target_height, target_width = old_image.shape[:2]
-            else:
-                # Use new region size
-                target_width = new_region.width
-                target_height = new_region.height
+            # Destination region in new image (where to copy to)
+            dst_x_start = max(0, -dx)
+            dst_y_start = max(0, -dy)
+            dst_x_end = min(target_width, target_width if dx <= 0 else target_width - dx)
+            dst_y_end = min(target_height, target_height if dy <= 0 else target_height - dy)
             
-            # Initialize new image and difference mask
-            if old_image is not None and old_image.size > 0:
-                dtype = old_image.dtype
-                num_channels = old_image.shape[2] if len(old_image.shape) > 2 else 1
-            else:
-                dtype = self.image.dtype if self.image.size > 0 else np.uint8
-                num_channels = 3
+            # Ensure bounds are valid
+            src_width = src_x_end - src_x_start
+            src_height = src_y_end - src_y_start
+            dst_width = dst_x_end - dst_x_start
+            dst_height = dst_y_end - dst_y_start
             
-            if num_channels > 1:
-                new_image = np.zeros((target_height, target_width, num_channels), dtype=dtype)
-            else:
-                new_image = np.zeros((target_height, target_width), dtype=dtype)
+            # Copy width/height is the minimum of source and destination
+            copy_width = min(src_width, dst_width)
+            copy_height = min(src_height, dst_height)
             
-            # If we have an old image, copy overlapping region
-            if old_image is not None and old_image.size > 0:
-                # Calculate relative offset (how much the region moved)
-                dx = new_region.left - old_region.left
-                dy = new_region.top - old_region.top
-                
-                # Calculate overlapping region in old image coordinates
-                
-                # Source region in old image (what to copy from)
-                src_x_start = max(0, -dx)
-                src_y_start = max(0, -dy)
-                src_x_end = min(old_image.shape[1], old_image.shape[1] - dx)
-                src_y_end = min(old_image.shape[0], old_image.shape[0] - dy)
-                
-                # Destination region in new image (where to copy to)
-                dst_x_start = max(0, dx)
-                dst_y_start = max(0, dy)
-                dst_x_end = min(target_width, target_width if dx >= 0 else target_width + dx)
-                dst_y_end = min(target_height, target_height if dy >= 0 else target_height + dy)
-                
-                # Ensure bounds are valid
-                src_width = src_x_end - src_x_start
-                src_height = src_y_end - src_y_start
-                dst_width = dst_x_end - dst_x_start
-                dst_height = dst_y_end - dst_y_start
-                
-                # Copy width/height is the minimum of source and destination
-                copy_width = min(src_width, dst_width)
-                copy_height = min(src_height, dst_height)
-                
-                if copy_width > 0 and copy_height > 0:
-                    # Copy overlapping region
-                    new_image[dst_y_start:dst_y_start+copy_height, 
-                             dst_x_start:dst_x_start+copy_width] = \
-                        old_image[src_y_start:src_y_start+copy_height,
-                                 src_x_start:src_x_start+copy_width]
-            
-            # Update image
-            self.image = new_image
+            if copy_width > 0 and copy_height > 0:
+                # Copy overlapping region
+                new_image[dst_y_start:dst_y_start+copy_height, 
+                            dst_x_start:dst_x_start+copy_width] = \
+                    old_image[src_y_start:src_y_start+copy_height,
+                                src_x_start:src_x_start+copy_width]
+        
+        # Update image
+        self.image = new_image.copy()
     
 class SemanticLayer(RenderLayer):
     """Render layer that stores semantic segmentation labels for each pixel."""
     def __init__(self, id, constant_size=None):
-        super().__init__(id, dtype=np.uint8, constant_size=constant_size)
+        super().__init__(id, dtype=np.uint8, constant_size=constant_size, num_channels=1)
         # Map for semantic information based on pixel value
         self.semantic_map = {}
         # Next label to assign for new objects (start from 1 since 0 is background)
@@ -602,9 +698,8 @@ class SemanticLayer(RenderLayer):
         """Remove a label from the semantic map."""
         if label in self.semantic_map:
             del self.semantic_map[label]
-            with self.image_lock:
-                # Clear pixels with this label (set to 0) in working image
-                self.image[self.image == label] = 0
+            # Clear pixels with this label (set to 0) in working image
+            self.image[self.image == label] = 0
     
     def add_label(self, obj_info):
         """Add a new object label to the semantic map.

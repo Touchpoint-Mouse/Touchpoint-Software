@@ -156,7 +156,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if self.emulator_gui.is_window_open():
                 for layer in self.render_pipeline.get_layers():
                     self.emulator_gui.update_layer_image(layer.id, layer.image)
-                self.render_pipeline.cycle_layer_states()
+            
+            # Cycle layer states for next frame (must happen every frame, not just when emulator is open)
+            self.render_pipeline.cycle_layer_states()
             
             # Run global handlers
             self.render_pipeline.dispatch_handlers()

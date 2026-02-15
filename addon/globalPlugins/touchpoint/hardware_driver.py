@@ -56,9 +56,8 @@ class HardwareDriver:
     
     def initialize(self, health_check=True):
         """Initialize the hardware driver and establish communication."""
-        if not self.uart.begin(self.SERIAL_PORT, self.SERIAL_BAUD_RATE):
+        if not self.uart.begin(self.SERIAL_PORT, self.SERIAL_BAUD_RATE, silent=True):
             self.hardware_connected = False
-            logMessage("Hardware not connected")
         else:
             # Wait for device ping
             self.hardware_connected = self._wait_for_ping()
@@ -133,8 +132,7 @@ class HardwareDriver:
             
     def set_max_elevation_speed(self, speed):
         """Set the maximum elevation speed for the device."""
-        with self.elevation_lock:
-            self.max_elevation_speed = speed
+        self.max_elevation_speed = speed
         
         if self.hardware_connected:
             # Send to hardware
@@ -154,23 +152,20 @@ class HardwareDriver:
             elevation: Elevation value to send (0.0-1.0)
             priority: Priority level of the command (higher values override lower ones)
         """
-        with self.elevation_lock:
-            # Update global elevation command if higher priority
-            if self.global_elevation_command is None or priority >= self.global_elevation_command[1]:
-                self.global_elevation_command = (elevation, priority)
-            else:
-                # Lower priority command ignored
-                return   
+        # Update global elevation command if higher priority
+        if self.global_elevation_command is None or priority >= self.global_elevation_command[1]:
+            self.global_elevation_command = (elevation, priority)
+        else:
+            # Lower priority command ignored
+            return   
             
     def add_elevation_offset(self, offset):
         """Add an elevation offset to the current elevation."""
-        with self.elevation_lock:
-            self.relative_elevation_offset += offset
+        self.relative_elevation_offset += offset
     
     def get_current_elevation(self):
         """Get the current elevation value."""
-        with self.elevation_lock:
-            return self.elevation
+        return self.elevation
     
     def get_max_elevation(self):
         """Get the maximum elevation constraint from config (read-only)."""

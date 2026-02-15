@@ -4,7 +4,7 @@
     "padding": 15
   },
   "layer_multipliers": {
-    "object_mesh": 1.0,
+    "object_mesh": 1.5,
     "depth": 4.0,
     "texture": 1.0
   }

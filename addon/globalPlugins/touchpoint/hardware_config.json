@@ -10,7 +10,7 @@
         "baud_rate": 460800
     },
     "display": {
-        "aspect_ratio": 0.5,
+        "aspect_ratio": 0.625,
         "resolution": 36.0
     },
     "elevation": {
