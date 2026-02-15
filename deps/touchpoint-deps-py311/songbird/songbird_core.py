@@ -13,7 +13,7 @@ from enum import Enum
 from typing import Optional, Callable, Dict, List, Tuple
 from collections import deque
 import logging
-
+from cobs import cobs
 from .istream import IStream
 
 
@@ -104,33 +104,31 @@ class Packet:
             reliable_mode: Reliability mode (RELIABLE or UNRELIABLE)
             
         Returns:
-            Packet as bytes
+            Packet as bytes (COBS encoded with 0x00 delimiter in STREAM mode)
         """
         out = bytearray()
-        payload_length = len(self.payload)
 
         if reliable_mode == ReliableMode.RELIABLE:
             # RELIABLE mode: no seq/guaranteed bytes
-            # STREAM: [header][length][payload]
+            # STREAM: [header][payload] (COBS encoded)
             # PACKET: [header][payload]
             out.append(self.header)
-            if mode == ProcessMode.STREAM:
-                out.append(payload_length & 0xFF)
         else:
             # UNRELIABLE mode: includes seq/guaranteed bytes
-            # STREAM: [header][length][seq][guaranteed][payload]
+            # STREAM: [header][seq][guaranteed][payload] (COBS encoded)
             # PACKET: [header][seq][guaranteed][payload]
             out.append(self.header)
-            if mode == ProcessMode.STREAM:
-                out.append(payload_length & 0xFF)
-                out.append(self.sequence_num & 0xFF)
-            elif mode == ProcessMode.PACKET:
-                out.append(self.sequence_num & 0xFF)
-            
+            out.append(self.sequence_num & 0xFF)
             out.append(1 if self.guaranteed_flag else 0)
 
         out.extend(self.payload)
-        return bytes(out)
+        
+        # Apply COBS encoding in STREAM mode
+        if mode == ProcessMode.STREAM:
+            encoded = cobs.encode(bytes(out))
+            return encoded + b'\x00'  # Add delimiter
+        else:
+            return bytes(out)
 
     def set_sequence_num(self, seq_num: int) -> None:
         """Set the sequence number."""
@@ -198,6 +196,23 @@ class Packet:
         """Write a 32-bit float to the payload (big-endian)."""
         self.payload.extend(struct.pack('>f', value))
 
+    def write_string(self, value: str) -> None:
+        """Write a string with length prefix (uint16_t length + UTF-8 bytes)."""
+        encoded = value.encode('utf-8')
+        length = len(encoded)
+        # Write length as uint16_t (big-endian)
+        self.payload.extend(struct.pack('>H', length))
+        # Write string bytes
+        self.payload.extend(encoded)
+
+    def write_protobuf(self, data: bytes) -> None:
+        """Write a length-prefixed byte array (for protobuf messages)."""
+        length = len(data)
+        # Write length as uint16_t (big-endian)
+        self.payload.extend(struct.pack('>H', length))
+        # Write protobuf bytes
+        self.payload.extend(data)
+
     # Reading functions
     def read_byte(self) -> int:
         """Read a single byte from the payload."""
@@ -233,6 +248,31 @@ class Packet:
         """Read a 16-bit integer from the payload (big-endian)."""
         data = self.read_bytes(2)
         return struct.unpack('>h', data)[0]
+
+    def read_string(self) -> str:
+        """Read a length-prefixed string from the payload."""
+        # Read length (uint16_t, big-endian)
+        length_data = self.read_bytes(2)
+        length = struct.unpack('>H', length_data)[0]
+        
+        # Read string bytes
+        if length == 0:
+            return ""
+        
+        string_data = self.read_bytes(length)
+        return string_data.decode('utf-8', errors='replace')
+
+    def read_protobuf(self) -> bytes:
+        """Read a length-prefixed byte array (for protobuf messages)."""
+        # Read length (uint16_t, big-endian)
+        length_data = self.read_bytes(2)
+        length = struct.unpack('>H', length_data)[0]
+        
+        # Read protobuf bytes
+        if length == 0:
+            return b""
+        
+        return self.read_bytes(length)
 
 
 class SongbirdCore:
@@ -577,10 +617,11 @@ class SongbirdCore:
                 self._call_handlers(p)
                 
         elif self.process_mode == ProcessMode.STREAM:
+            # Accumulate data and look for 0x00 delimiters (COBS packets)
             self._append_to_read_buffer(data)
             
             while True:
-                pkt = self._packet_from_stream()
+                pkt = self._packet_from_stream_cobs()
                 if not pkt:
                     current_time_ms = time.time() * 1000
                     if current_time_ms - self.last_data_time_ms > self.missing_packet_timeout_ms:
@@ -665,6 +706,55 @@ class SongbirdCore:
                     pkt.set_guaranteed()
                 
                 del self.read_buffer[:4 + payload_len]
+                return pkt
+
+    def _packet_from_stream_cobs(self) -> Optional[Packet]:
+        """Parse COBS-encoded packet from stream buffer."""
+        with self.data_lock:
+            # Look for 0x00 delimiter
+            try:
+                delimiter_idx = self.read_buffer.index(0x00)
+            except ValueError:
+                # No complete packet yet
+                return None
+            
+            # Extract and decode COBS packet
+            if delimiter_idx == 0:
+                # Empty packet, skip delimiter
+                del self.read_buffer[0]
+                return None
+            
+            cobs_data = bytes(self.read_buffer[:delimiter_idx])
+            del self.read_buffer[:delimiter_idx + 1]  # Remove packet + delimiter
+            
+            try:
+                decoded = cobs.decode(cobs_data)
+            except cobs.DecodeError:
+                logging.error("COBS decode error, skipping packet")
+                return None
+            
+            if len(decoded) < 1:
+                return None
+            
+            # Parse decoded packet
+            if self.reliable_mode == ReliableMode.RELIABLE:
+                # RELIABLE: [header][payload]
+                header = decoded[0]
+                payload = decoded[1:] if len(decoded) > 1 else b""
+                return Packet(header, payload)
+            else:
+                # UNRELIABLE: [header][seq][guaranteed][payload]
+                if len(decoded) < 3:
+                    return None
+                header = decoded[0]
+                seq_num = decoded[1]
+                guaranteed = decoded[2]
+                payload = decoded[3:] if len(decoded) > 3 else b""
+                
+                pkt = Packet(header, payload)
+                pkt.set_sequence_num(seq_num)
+                if guaranteed:
+                    pkt.set_guaranteed()
                 return pkt
 
     def _call_handlers(self, pkt: Packet) -> None:

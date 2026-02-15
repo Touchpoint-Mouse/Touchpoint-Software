@@ -38,13 +38,14 @@ class SongbirdUART(IStream):
         """Cleanup on deletion."""
         self.close()
 
-    def begin(self, port: str, baud_rate: int) -> bool:
+    def begin(self, port: str, baud_rate: int, silent: bool = False) -> bool:
         """
         Initialize and open the serial port.
         
         Args:
             port: Serial port name (e.g., 'COM3' on Windows, '/dev/ttyUSB0' on Linux)
             baud_rate: Baud rate for serial communication
+            silent: If True, suppress error logging on connection failure
             
         Returns:
             True if successful, False otherwise
@@ -70,7 +71,8 @@ class SongbirdUART(IStream):
             
             return True
         except (serial.SerialException, OSError) as e:
-            logging.error(f"Error opening serial port: {e}")
+            if not silent:
+                logging.error(f"Error opening serial port: {e}")
             return False
 
     def write(self, buffer: bytes) -> None:

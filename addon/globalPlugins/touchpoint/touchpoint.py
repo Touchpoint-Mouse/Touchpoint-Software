@@ -17,7 +17,7 @@ import os
 import ctypes
 from .utils import logMessage, logUIElement
 from .handlers import ObjectHandlerManager, GlobalHandlerManager
-from .render_config import objectHandlerList, globalHandlerList, renderLayerList, rendererList
+from .render_config import initialize_render_config
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
 from .emulator_gui import TouchpointEmulatorGUI
@@ -43,11 +43,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.enabled = True
         
         # Hardware configuration
-        self.max_elevation_speed = 180 # units per second
         self.hardware = HardwareDriver(self)
         
         # Emulator GUI
         self.emulator_gui = TouchpointEmulatorGUI()
+        
+        # Initialize render configuration (layers, renderers, handlers)
+        renderLayerList, rendererList, objectHandlerList, globalHandlerList = initialize_render_config(self)
         
         # Object handler manager
         self.objectHandlers = ObjectHandlerManager(self)
@@ -61,14 +63,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.capture_region_width = 100
         self.capture_region_height = 100
         
-        # Create initial region
-        initial_region = Region(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
-        
         # Render layers and renderers
         self.renderLayers = renderLayerList
         for layer in self.renderLayers:
             layer.set_plugin(self)
-            layer.update_region_size(initial_region)
+            # Initialize with first region bounds
+            initial_region = Region(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
+            layer.update_region_bounds(initial_region)
             
         self.renderers = rendererList
         for renderer in self.renderers:
@@ -104,9 +105,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Initialize hardware driver
             self.hardware.initialize()
             
-            # Set max elevation speed
-            self.hardware.set_max_elevation_speed(self.max_elevation_speed)
-            
             # Initialize renderers if needed (currently they are just data containers, but this is where setup would go)
             for renderer in self.renderers:
                 renderer.initialize()
@@ -117,7 +115,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             self.emulator_gui.initialize_layers(layer_ids, aspect_ratio)
             
             # Initialize emulator with hardware settings
-            self.emulator_gui.set_max_elevation(self.hardware.get_max_elevation())
+            self.emulator_gui.set_max_elevation(self.hardware.max_elevation)
             self.emulator_gui.set_elevation_speed(self.hardware.max_elevation_speed)
             
             # Start render thread
@@ -154,6 +152,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             with self.mouse_position_lock:
                 # Update mouse position variable
                 self.mouse_position = current_pos
+            
+            # Update region bounds for all layers before running renderers
+            for layer in self.renderLayers:
+                # Calculate new region centered on current mouse position
+                new_region = Region(
+                    left=current_pos[0] - self.capture_region_width // 2,
+                    top=current_pos[1] - self.capture_region_height // 2,
+                    width=self.capture_region_width,
+                    height=self.capture_region_height
+                )
+                layer.update_region_bounds(new_region)
                 
             # Execute renderers in order
             for renderer in self.renderers:
@@ -163,6 +172,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if self.emulator_gui.is_window_open():
                 for layer in self.renderLayers:
                     self.emulator_gui.update_layer_image(layer.id, layer.image)
+                    layer.cycle_state()  # Cycle layer state for next frame
             
             # Run global handlers
             self.globalHandlers.dispatch_events()
@@ -389,7 +399,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.emulator_gui.initialize_layers(layer_ids, aspect_ratio)
         
         # Update emulator with current hardware settings
-        self.emulator_gui.set_max_elevation(self.hardware.get_max_elevation())
+        self.emulator_gui.set_max_elevation(self.hardware.max_elevation)
         self.emulator_gui.set_elevation_speed(self.hardware.max_elevation_speed)
         
         # Open the window

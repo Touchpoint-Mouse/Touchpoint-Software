@@ -237,9 +237,15 @@ A thread-safe data container for rendered image data:
 - **`id`** - Unique identifier (e.g., "capture", "depth", "semantic")
 - **`image`** - NumPy array storing the rendered data
 - **`image_lock`** - Threading lock for safe concurrent access
+- **`constant_size`** - If True, image maintains fixed dimensions despite region movement
+- **`current_region`** - Current absolute screen region bounds
+- **`prev_region`** - Previous region bounds for relative tracking
+- **`relative_offset`** - (dx, dy) offset from previous to current region
+- **`diff_mask`** - Boolean mask marking changed/new pixels
 - **`get_image()`** - Returns thread-safe copy of current image
-- **`update_image(new_image)`** - Updates image with thread safety
-- **`update_region_size(region)`** - Resizes layer while preserving content
+- **`get_diff_mask()`** - Returns mask of changed pixels
+- **`update_region_bounds(region)`** - Updates region with relative tracking and diff masking
+- **`cycle_state()`** - Updates previous state for next frame comparison
 - **`get_screen_region()`** - Returns absolute screen coordinates for capture
 
 **Predefined Layers:**
@@ -304,7 +310,13 @@ The render thread executes continuously at 100 Hz (10ms intervals):
    ↓
 2. Update mouse position: winUser.getCursorPos()
    ↓
-3. Execute renderers in sequence:
+3. Update region bounds for all layers:
+   - Calculate new region centered on mouse
+   - layer.update_region_bounds(new_region)
+   - Tracks relative offset from previous position
+   - Creates diff mask for changed/new pixels
+   ↓
+4. Execute renderers in sequence:
    |
    ├─> CaptureRenderer:
    |     - Camera thread captures screen region centered on mouse
@@ -319,37 +331,53 @@ The render thread executes continuously at 100 Hz (10ms intervals):
          - Read center pixel from depthLayer
          - Send elevation command to hardware
    ↓
-4. Update Emulator GUI (if open):
+5. Update Emulator GUI (if open):
    - For each layer: emulator_gui.update_layer_image(layer.id, layer.image)
    ↓
-5. Execute Global Handlers:
+6. Execute Global Handlers:
    - globalHandlers.dispatch_events()
    - Check border detection, custom conditions
    ↓
-6. Cycle Hardware State Machine:
+7. Cycle Hardware State Machine:
    - hardware.cycle_state()
    - Process command queue, update device
    ↓
-7. Sleep 10ms, repeat
+8. Sleep 10ms, repeat
 ```
 
 ### Region Management
 
-Render regions are dynamically sized and centered on the mouse cursor:
+Render regions use relative bounds tracking with difference masking:
 
 ```python
 # Region definition
 Region = namedtuple('Region', ['left', 'top', 'width', 'height'])
 
-# Default configuration (100x100 pixels centered on cursor)
-capture_region_width = 100
-capture_region_height = 100
+# Each layer tracks region bounds and offsets
+class RenderLayer:
+    def __init__(self, id, dtype=np.uint8, constant_size=True):
+        self.constant_size = constant_size  # Maintains fixed image dimensions
+        self.current_region = Region(0, 0, 0, 0)
+        self.prev_region = Region(0, 0, 0, 0)
+        self.relative_offset = (0, 0)  # (dx, dy) from previous region
+        self.diff_mask = np.array([], dtype=bool)  # True = changed/new pixels
 
-# Each layer calculates its screen region:
-left = mouse_x - (width // 2)
-top = mouse_y - (height // 2)
-region = Region(left, top, width, height)
+# Called every cycle before renderers execute
+def update_region_bounds(new_region):
+    # Calculate relative offset
+    dx = new_region.left - old_region.left
+    dy = new_region.top - old_region.top
+    
+    # Copy overlapping pixels from old image to new position
+    # Create diff_mask: False for overlapping region, True for new areas
+    # If constant_size=True, maintains fixed image dimensions
 ```
+
+**Benefits:**
+- **Efficient Updates**: Only process pixels that changed or moved into view
+- **Smooth Movement**: Preserves image content when mouse moves
+- **Constant Size Option**: Image resolution stays fixed for consistent processing
+- **Difference Masking**: Renderers can optimize by checking diff_mask
 
 ### NVDA Object Events Flow
 
@@ -758,33 +786,31 @@ rendererList = [
 
 ```python
 # In touchpoint.py - Dynamic region sizing
-def update_capture_region_size(self, width, height):
-    """Update the capture region size for all layers."""
-    new_region = Region(left=0, top=0, width=width, height=height)
-    
-    for layer in self.renderLayers:
-        layer.update_region_size(new_region)
+# Region bounds are automatically updated each cycle in _render_thread
+# Just change the capture_region_width/height and the next cycle will apply it
+
+def event_gainFocus(self, obj, nextHandler):
+    if obj.role == controlTypes.Role.DOCUMENT:
+        # Use larger region for documents
+        self.capture_region_width = 200
+        self.capture_region_height = 200
+        # Next render cycle will update all layers automatically
+    else:
+        # Use default smaller region
+        self.capture_region_width = 100
+        self.capture_region_height = 100
     
     # Update emulator aspect ratio
-    aspect_ratio = width / height
+    aspect_ratio = self.capture_region_width / self.capture_region_height
     self.emulator_gui.initialize_layers(
         [layer.id for layer in self.renderLayers],
         aspect_ratio
     )
     
-    logMessage(f"Updated capture region: {width}x{height}")
-
-# Example usage - larger region for detailed content
-def event_gainFocus(self, obj, nextHandler):
-    if obj.role == controlTypes.Role.DOCUMENT:
-        # Use larger region for documents
-        self.update_capture_region_size(200, 200)
-    else:
-        # Use default smaller region
-        self.update_capture_region_size(100, 100)
-    
     nextHandler()
 ```
+
+**Note**: With constant_size=True (default), layers maintain fixed image dimensions even when the region moves or resizes. The relative bounds tracking ensures smooth transitions.
 
 ## Performance Considerations
 

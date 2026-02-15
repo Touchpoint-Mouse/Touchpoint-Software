@@ -1,3 +1,4 @@
+import math
 import threading
 from .dependencies import np, cv2
 from .utils import logMessage
@@ -111,6 +112,36 @@ class CaptureRenderer(Renderer):
             except Exception as e:
                 logMessage(f"[ERROR] CaptureRenderer failed: {e}")
                 time.sleep(0.01)  # Small delay to prevent excessive CPU usage
+                
+class ObjectRenderer(Renderer):
+    """Renderer that finds unique NVDA objects using a mesh grid and updates layer image with object labels."""
+    def __init__(self, capture_layer, object_layer):
+        """Initialize with layer reference.
+        
+        Args:
+            capture_layer: CaptureLayer to read from
+            object_layer: SemanticLayer to write object labels to
+        """
+        self.capture_layer = capture_layer
+        self.object_layer = object_layer
+        
+    def __call__(self):
+        """Find unique NVDA objects using a mesh grid and update layer image with object labels."""
+        # Get capture layer difference mask to determine which regions have changed
+        diff_mask = self.capture_layer.get_diff_mask()
+        if np.all(diff_mask == False):
+            return  # No changes, skip processing
+        
+        # Iterate through current semantic labels and check whether location boundaries intersect with changed regions in capture layer
+        # If so, update semantic layer labels for those regions
+        for label, info in self.object_layer.semantic_map.items():
+            pass
+            
+        # Get hardware texture resolution and convert to mesh dimensions
+        texture_resolution = self.plugin.hardware.texture_resolution
+        aspect_ratio = self.capture_layer.image.shape[1] / self.capture_layer.image.shape[0]
+        mesh_height = int(self.capture_layer.image.shape[0] / math.sqrt(texture_resolution/aspect_ratio))
+        mesh_width = int(self.capture_layer.image.shape[1] / mesh_height*aspect_ratio)
 
 class DepthRenderer(Renderer):
     """Renderer that computes depth map from capture layer and writes to depth layer."""
@@ -191,76 +222,242 @@ class ElevationRenderer(Renderer):
 class RenderLayer:
     """Simple data container for render layers."""
     
-    def __init__(self, id, dtype=np.uint8):
+    def __init__(self, id, dtype=np.uint8, constant_size=False):
         self.plugin = None
         self.id = id
+        self.constant_size = constant_size  # If True, image maintains fixed dimensions
         
         # Render image
         self.image = np.array([], dtype=dtype)  # Placeholder for the rendered image data
+        # Previous render image for diffing
+        self.prev_image = np.array([], dtype=dtype)
         # Lock for synchronizing access to the image
         self.image_lock = threading.Lock()
+        
+        # Region tracking for relative bounds
+        self.current_region = Region(0, 0, 0, 0)  # Current absolute screen region
+        self.prev_region = Region(0, 0, 0, 0)  # Previous absolute screen region
         
     def get_image(self):
         """Get the current rendered image with thread safety."""
         with self.image_lock:
             return self.image.copy()
-    
-    def update_image(self, new_image):
-        """Update the rendered image with thread safety.
+        
+    def get_diff_mask(self):
+        """Calculate and return the difference mask with thread safety.
+        
+        Compares current image with previous image, taking into account region offset.
+        Returns a boolean array where True indicates pixels that have changed or are
+        in non-overlapping regions.
+        
+        Returns:
+            Boolean array where True indicates pixels that need updating.
         """
         with self.image_lock:
+            # If no current image, return empty mask
+            if self.image.size == 0:
+                return np.array([], dtype=bool)
+            
+            # Get image dimensions
+            if len(self.image.shape) >= 2:
+                img_height, img_width = self.image.shape[:2]
+            else:
+                return np.ones((0, 0), dtype=bool)
+            
+            # If no previous image or regions not initialized, all pixels are "changed"
+            if self.prev_image.size == 0 or self.prev_region.width == 0 or self.current_region.width == 0:
+                return np.ones((img_height, img_width), dtype=bool)
+            
+            # Calculate relative offset between current and previous regions
+            dx = self.current_region.left - self.prev_region.left
+            dy = self.current_region.top - self.prev_region.top
+            
+            # Initialize diff mask (all True = all pixels are "changed")
+            diff_mask = np.ones((img_height, img_width), dtype=bool)
+            
+            # Calculate overlapping region to compare
+            # Source region in previous image (what to compare from)
+            src_x_start = max(0, -dx)
+            src_y_start = max(0, -dy)
+            src_x_end = min(self.prev_image.shape[1], self.prev_image.shape[1] - dx)
+            src_y_end = min(self.prev_image.shape[0], self.prev_image.shape[0] - dy)
+            
+            # Destination region in current image (what to compare to)
+            dst_x_start = max(0, dx)
+            dst_y_start = max(0, dy)
+            dst_x_end = min(img_width, img_width if dx >= 0 else img_width + dx)
+            dst_y_end = min(img_height, img_height if dy >= 0 else img_height + dy)
+            
+            # Ensure bounds are valid
+            src_width = src_x_end - src_x_start
+            src_height = src_y_end - src_y_start
+            dst_width = dst_x_end - dst_x_start
+            dst_height = dst_y_end - dst_y_start
+            
+            # Compare width/height is the minimum of source and destination
+            compare_width = min(src_width, dst_width)
+            compare_height = min(src_height, dst_height)
+            
+            if compare_width > 0 and compare_height > 0:
+                # Get overlapping regions from both images
+                prev_overlap = self.prev_image[src_y_start:src_y_start+compare_height,
+                                               src_x_start:src_x_start+compare_width]
+                curr_overlap = self.image[dst_y_start:dst_y_start+compare_height,
+                                          dst_x_start:dst_x_start+compare_width]
+                
+                # Compare pixels - check if any channel differs
+                if len(self.image.shape) > 2:  # Multi-channel image
+                    pixel_diff = np.any(prev_overlap != curr_overlap, axis=2)
+                else:  # Single-channel image
+                    pixel_diff = prev_overlap != curr_overlap
+                
+                # Update diff mask for overlapping region
+                diff_mask[dst_y_start:dst_y_start+compare_height,
+                         dst_x_start:dst_x_start+compare_width] = pixel_diff
+            
+            return diff_mask.copy()
+    
+    def update_image(self, new_image):
+        """Update the rendered image with thread safety."""
+        with self.image_lock:
             self.image = new_image.copy()
+            
+    def cycle_state(self):
+        """Update the previous image and region to the current ones."""
+        with self.image_lock:
+            self.prev_image = self.image.copy()
+            self.prev_region = self.current_region
         
     def set_plugin(self, plugin):
         """Set the parent plugin for this layer."""
         self.plugin = plugin
     
-    def update_region_size(self, region):
-        """Update the layer based on change in region size.
+    def update_region_bounds(self, new_region):
+        """Update the layer based on new region bounds (position and size).
+        
+        Tracks relative offset from previous region and copies overlapping pixels.
+        If constant_size is True, maintains fixed image dimensions.
         
         Args:
-            region: Region namedtuple with (left, top, width, height)
+            new_region: Region namedtuple with (left, top, width, height) in screen coordinates
         """
-        # Saves current image
-        oldImage = self.get_image()
+        with self.image_lock:
+            # Store old state
+            old_image = self.image.copy() if self.image.size > 0 else None
+            old_region = self.current_region
             
-        # Preserve dtype from old image
-        dtype = oldImage.dtype
-        
-        # Creates blank image with new region size and same dtype
-        new_image = np.zeros((region.height, region.width, 3), dtype=dtype)
-        
-        if (oldImage.size > 0):
-            # Gets cropped size of old image to copy over
-            crop_width = min(oldImage.shape[1], region.width)
-            crop_height = min(oldImage.shape[0], region.height)
+            # Update current region
+            self.current_region = new_region
             
-            # Copies centered cropped portion of old image to new image
-            if crop_width > 0 and crop_height > 0:
-                x_offset = (region.width - crop_width) // 2
-                y_offset = (region.height - crop_height) // 2
-                new_image[y_offset:y_offset+crop_height, x_offset:x_offset+crop_width] = oldImage[:crop_height, :crop_width]
+            # Determine target image size
+            if self.constant_size and old_image is not None and old_image.size > 0:
+                # Maintain constant size
+                target_height, target_width = old_image.shape[:2]
+            else:
+                # Use new region size
+                target_width = new_region.width
+                target_height = new_region.height
             
-        # Update image with new image
-        self.update_image(new_image)
+            # Initialize new image and difference mask
+            if old_image is not None and old_image.size > 0:
+                dtype = old_image.dtype
+                num_channels = old_image.shape[2] if len(old_image.shape) > 2 else 1
+            else:
+                dtype = self.image.dtype if self.image.size > 0 else np.uint8
+                num_channels = 3
+            
+            if num_channels > 1:
+                new_image = np.zeros((target_height, target_width, num_channels), dtype=dtype)
+            else:
+                new_image = np.zeros((target_height, target_width), dtype=dtype)
+            
+            # If we have an old image, copy overlapping region
+            if old_image is not None and old_image.size > 0:
+                # Calculate relative offset (how much the region moved)
+                dx = new_region.left - old_region.left
+                dy = new_region.top - old_region.top
+                
+                # Calculate overlapping region in old image coordinates
+                
+                # Source region in old image (what to copy from)
+                src_x_start = max(0, -dx)
+                src_y_start = max(0, -dy)
+                src_x_end = min(old_image.shape[1], old_image.shape[1] - dx)
+                src_y_end = min(old_image.shape[0], old_image.shape[0] - dy)
+                
+                # Destination region in new image (where to copy to)
+                dst_x_start = max(0, dx)
+                dst_y_start = max(0, dy)
+                dst_x_end = min(target_width, target_width if dx >= 0 else target_width + dx)
+                dst_y_end = min(target_height, target_height if dy >= 0 else target_height + dy)
+                
+                # Ensure bounds are valid
+                src_width = src_x_end - src_x_start
+                src_height = src_y_end - src_y_start
+                dst_width = dst_x_end - dst_x_start
+                dst_height = dst_y_end - dst_y_start
+                
+                # Copy width/height is the minimum of source and destination
+                copy_width = min(src_width, dst_width)
+                copy_height = min(src_height, dst_height)
+                
+                if copy_width > 0 and copy_height > 0:
+                    # Copy overlapping region
+                    new_image[dst_y_start:dst_y_start+copy_height, 
+                             dst_x_start:dst_x_start+copy_width] = \
+                        old_image[src_y_start:src_y_start+copy_height,
+                                 src_x_start:src_x_start+copy_width]
+            
+            # Update image
+            self.image = new_image
     
     def get_screen_region(self):
         """Get the absolute screen region for this layer as (left, top, width, height).
         
+        Returns the current region if constant_size is True, otherwise calculates
+        a new region centered on the mouse.
+        
         Returns:
-            tuple: (left, top, width, height) in screen coordinates
+            Region: (left, top, width, height) in screen coordinates
         """
+        with self.image_lock:
+            if self.constant_size and self.current_region.width > 0:
+                # Return the stored current region for constant size layers
+                return self.current_region
+            
+            # Calculate new region centered on mouse
+            mouse_x, mouse_y = self.plugin.get_mouse_position()
+            
+            # Get image dimensions safely
+            if self.image.size > 0:
+                if len(self.image.shape) >= 2:
+                    height, width = self.image.shape[:2]
+                else:
+                    width = height = 0
+            else:
+                width = height = 0
+            
+            if width == 0 or height == 0:
+                # No valid image, use default or plugin capture region size
+                if self.plugin:
+                    width = self.plugin.capture_region_width
+                    height = self.plugin.capture_region_height
+                else:
+                    width = height = 100
+            
+            # Center region on mouse position
+            half_width = width // 2
+            half_height = height // 2
+            
+            left = mouse_x - half_width
+            top = mouse_y - half_height
+            
+            return Region(left, top, width, height)
+    
+class SemanticLayer(RenderLayer):
+    """Render layer that stores semantic segmentation labels for each pixel."""
+    def __init__(self, id, constant_size=True):
+        super().__init__(id, dtype=np.uint8, constant_size=constant_size)
+        # Map for semantic information based on pixel value
+        self.semantic_map = {}
         
-        mouse_x, mouse_y = self.plugin.get_mouse_position()
-        
-        # Center region on mouse position
-        half_width = self.image.shape[1] // 2
-        half_height = self.image.shape[0] // 2
-        
-        left = mouse_x - half_width
-        top = mouse_y - half_height
-        
-        width = self.image.shape[1]
-        height = self.image.shape[0]
-        
-        return Region(left, top, width, height)

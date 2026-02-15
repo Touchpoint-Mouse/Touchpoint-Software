@@ -1,23 +1,46 @@
 import time
 import threading
+import json
+import os
 
 from songbird import SongbirdUART
 from .utils import logMessage
 from .dependencies import np
 
 class HardwareDriver:
-    # Header definitions
-    H_PING = 0xFF
-    H_ELEVATION = 0x10
-    H_ELEVATION_SPEED = 0x11
-    H_VIBRATION = 0x20
-    
-    # Serial configuration
-    SERIAL_PORT = "COM6"
-    SERIAL_BAUD_RATE = 460800
+    @staticmethod
+    def load_config():
+        """Load hardware configuration from JSON file."""
+        config_path = os.path.join(os.path.dirname(__file__), 'hardware_config.json')
+        try:
+            with open(config_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logMessage(f"[ERROR] Failed to load hardware config: {e}")
+            # Return default configuration
+            return {
+                "headers": {"ping": 255, "elevation": 16, "elevation_speed": 17, "vibration": 32},
+                "serial": {"port": "COM6", "baud_rate": 460800},
+                "elevation": {"max_elevation": 180, "max_elevation_speed": 180},
+                "texture": {"texture_resolution": 36.0, "aspect_ratio": 0.5}
+            }
     
     def __init__(self, plugin):
         self.plugin = plugin
+        
+        # Load hardware configuration
+        self.config = self.load_config()
+        
+        # Header definitions from config
+        self.H_PING = self.config['headers']['ping']
+        self.H_ELEVATION = self.config['headers']['elevation']
+        self.H_ELEVATION_SPEED = self.config['headers']['elevation_speed']
+        self.H_VIBRATION = self.config['headers']['vibration']
+        
+        # Serial configuration from config
+        self.SERIAL_PORT = self.config['serial']['port']
+        self.SERIAL_BAUD_RATE = self.config['serial']['baud_rate']
+        
         # UART connection for hardware
         self.uart = SongbirdUART("Touchpoint NVDA Addon")
         self.uart_core = self.uart.get_protocol()
@@ -35,11 +58,15 @@ class HardwareDriver:
         # Highest priority global elevation command (None if no command active)
         # Format: (elevation_value, priority_level)
         self.global_elevation_command = None
-        # Maximum elevation (units)
-        self.max_elevation = 180
-        # Maximum elevation speed (units per second)
-        self.max_elevation_speed = 255
-        self.elevation_lock = threading.Lock()  # Lock for elevation state
+        # Maximum elevation (units) - read-only from config
+        self.max_elevation = self.config['elevation']['max_elevation']
+        # Maximum elevation speed (units per second) - can be changed dynamically
+        self.max_elevation_speed = self.config['elevation']['max_elevation_speed']
+        
+        # Texture resolution (equivalent dots per display region)
+        self.texture_resolution = self.config['texture']['texture_resolution']
+        # Aspect ratio of texture pixels (width/height)
+        self.texture_aspect_ratio = self.config['texture']['aspect_ratio']
     
     def initialize(self, health_check=True):
         """Initialize the hardware driver and establish communication."""
@@ -133,15 +160,6 @@ class HardwareDriver:
         # Update emulator GUI if available
         if self.plugin.emulator_gui:
             self.plugin.emulator_gui.set_elevation_speed(speed)
-    
-    def set_max_elevation(self, elevation):
-        """Set the maximum elevation constraint for the device."""
-        with self.elevation_lock:
-            self.max_elevation = elevation
-        
-        # Update emulator GUI if available
-        if self.plugin.emulator_gui:
-            self.plugin.emulator_gui.set_max_elevation(elevation)
                    
     def set_global_elevation(self, elevation, priority=0):
         """Send an elevation command to the device.
@@ -169,28 +187,26 @@ class HardwareDriver:
             return self.elevation
     
     def get_max_elevation(self):
-        """Get the current maximum elevation constraint."""
-        with self.elevation_lock:
-            return self.max_elevation
+        """Get the maximum elevation constraint from config (read-only)."""
+        return self.max_elevation
         
     def cycle_state(self):
         """Cycle the hardware state machine. Should be called periodically."""
         # Determine effective elevation command
         elevation = 0
-        with self.elevation_lock:
-            if self.global_elevation_command is not None:
-                # Use global elevation command
-                self.elevation = self.global_elevation_command[0]
-                
-            # Add relative elevation offset
-            self.elevation += self.relative_elevation_offset
-            # Clamp resulting elevation to valid range
-            self.elevation = max(0, min(self.max_elevation, self.elevation))
+        if self.global_elevation_command is not None:
+            # Use global elevation command
+            self.elevation = self.global_elevation_command[0]
             elevation = self.elevation
             
-            # Reset relative elevation offset and global elevation command
-            self.relative_elevation_offset = 0.0
-            self.global_elevation_command = None
+        # Add relative elevation offset
+        elevation += self.relative_elevation_offset
+        # Clamp resulting elevation to valid range
+        elevation = max(0, min(self.max_elevation, elevation))
+        
+        # Reset relative elevation offset and global elevation command
+        self.relative_elevation_offset = 0.0
+        self.global_elevation_command = None
         
         # Send current elevation to hardware
         if self.hardware_connected:
