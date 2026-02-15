@@ -1,45 +1,28 @@
 import time
 import threading
-import json
-import os
 
 from songbird import SongbirdUART
 from .utils import logMessage
 from .dependencies import np
+from .config import TouchpointConfig
 
 class HardwareDriver:
-    @staticmethod
-    def load_config():
-        """Load hardware configuration from JSON file."""
-        config_path = os.path.join(os.path.dirname(__file__), 'hardware_config.json')
-        try:
-            with open(config_path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logMessage(f"[ERROR] Failed to load hardware config: {e}")
-            # Return default configuration
-            return {
-                "headers": {"ping": 255, "elevation": 16, "elevation_speed": 17, "vibration": 32},
-                "serial": {"port": "COM6", "baud_rate": 460800},
-                "elevation": {"max_elevation": 180, "max_elevation_speed": 180},
-                "texture": {"texture_resolution": 36.0, "aspect_ratio": 0.5}
-            }
-    
     def __init__(self, plugin):
         self.plugin = plugin
         
-        # Load hardware configuration
-        self.config = self.load_config()
+        # Get centralized configuration (singleton - only created once)
+        self.config = TouchpointConfig.get_instance()
+        hw_config = self.config.hardware
         
         # Header definitions from config
-        self.H_PING = self.config['headers']['ping']
-        self.H_ELEVATION = self.config['headers']['elevation']
-        self.H_ELEVATION_SPEED = self.config['headers']['elevation_speed']
-        self.H_VIBRATION = self.config['headers']['vibration']
+        self.H_PING = hw_config['headers']['ping']
+        self.H_ELEVATION = hw_config['headers']['elevation']
+        self.H_ELEVATION_SPEED = hw_config['headers']['elevation_speed']
+        self.H_VIBRATION = hw_config['headers']['vibration']
         
         # Serial configuration from config
-        self.SERIAL_PORT = self.config['serial']['port']
-        self.SERIAL_BAUD_RATE = self.config['serial']['baud_rate']
+        self.SERIAL_PORT = hw_config['serial']['port']
+        self.SERIAL_BAUD_RATE = hw_config['serial']['baud_rate']
         
         # UART connection for hardware
         self.uart = SongbirdUART("Touchpoint NVDA Addon")
@@ -59,14 +42,17 @@ class HardwareDriver:
         # Format: (elevation_value, priority_level)
         self.global_elevation_command = None
         # Maximum elevation (units) - read-only from config
-        self.max_elevation = self.config['elevation']['max_elevation']
+        self.max_elevation = hw_config['elevation']['max_elevation']
         # Maximum elevation speed (units per second) - can be changed dynamically
-        self.max_elevation_speed = self.config['elevation']['max_elevation_speed']
+        self.max_elevation_speed = hw_config['elevation']['max_elevation_speed']
         
-        # Texture resolution (equivalent dots per display region)
-        self.texture_resolution = self.config['texture']['texture_resolution']
+        # Display resolution (equivalent dots per display region)
+        self.resolution = hw_config['display']['resolution']
         # Aspect ratio of texture pixels (width/height)
-        self.texture_aspect_ratio = self.config['texture']['aspect_ratio']
+        self.aspect_ratio = hw_config['display']['aspect_ratio']
+        
+        # Mesh dimensions (calculated from resolution and aspect ratio)
+        self.mesh_dims = self.config.get_mesh_dimensions()
     
     def initialize(self, health_check=True):
         """Initialize the hardware driver and establish communication."""

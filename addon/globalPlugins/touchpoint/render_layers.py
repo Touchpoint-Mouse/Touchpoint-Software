@@ -73,8 +73,9 @@ class CaptureRenderer(Renderer):
                 return
                 
             try:
-                # Get region bounding box
-                left, top, width, height = self.layer.get_screen_region()
+                # Get region from layer's current region
+                region = self.layer.current_region
+                left, top, width, height = region.left, region.top, region.width, region.height
                 
                 # Get screen size
                 screen_width, screen_height = self.plugin.get_screen_size()
@@ -137,10 +138,10 @@ class ObjectRenderer(Renderer):
         for label, info in self.object_layer.semantic_map.items():
             pass
             
-        # Get hardware texture resolution and convert to mesh dimensions
-        texture_resolution = self.plugin.hardware.texture_resolution
+        # Get hardware resolution and convert to mesh dimensions
+        hardware_resolution = self.plugin.hardware.resolution
         aspect_ratio = self.capture_layer.image.shape[1] / self.capture_layer.image.shape[0]
-        mesh_height = int(self.capture_layer.image.shape[0] / math.sqrt(texture_resolution/aspect_ratio))
+        mesh_height = int(self.capture_layer.image.shape[0] / math.sqrt(hardware_resolution/aspect_ratio))
         mesh_width = int(self.capture_layer.image.shape[1] / mesh_height*aspect_ratio)
 
 class DepthRenderer(Renderer):
@@ -222,10 +223,13 @@ class ElevationRenderer(Renderer):
 class RenderLayer:
     """Simple data container for render layers."""
     
-    def __init__(self, id, dtype=np.uint8, constant_size=False):
+    def __init__(self, id, dtype=np.uint8, constant_size=None):
         self.plugin = None
         self.id = id
-        self.constant_size = constant_size  # If True, image maintains fixed dimensions
+        # constant_size can be:
+        # - None or False: Dynamic size following region bounds
+        # - Tuple (width, height): Fixed dimensions in pixels
+        self.constant_size = constant_size
         
         # Render image
         self.image = np.array([], dtype=dtype)  # Placeholder for the rendered image data
@@ -318,8 +322,23 @@ class RenderLayer:
             return diff_mask.copy()
     
     def update_image(self, new_image):
-        """Update the rendered image with thread safety."""
+        """Update the rendered image with thread safety.
+        
+        Automatically resizes image for constant_size layers using cv2.resize.
+        
+        Args:
+            new_image: New image to set (will be resized if constant_size is set)
+        """
         with self.image_lock:
+            # If constant_size is set, resize the image to match
+            if self.constant_size:
+                target_width, target_height = self.constant_size
+                # Check if resize is needed
+                if new_image.shape[:2] != (target_height, target_width):
+                    # Resize using cv2 (import from dependencies)
+                    from .dependencies import cv2
+                    new_image = cv2.resize(new_image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+            
             self.image = new_image.copy()
             
     def cycle_state(self):
@@ -336,7 +355,7 @@ class RenderLayer:
         """Update the layer based on new region bounds (position and size).
         
         Tracks relative offset from previous region and copies overlapping pixels.
-        If constant_size is True, maintains fixed image dimensions.
+        If constant_size is set to (width, height), maintains those fixed dimensions.
         
         Args:
             new_region: Region namedtuple with (left, top, width, height) in screen coordinates
@@ -350,8 +369,12 @@ class RenderLayer:
             self.current_region = new_region
             
             # Determine target image size
-            if self.constant_size and old_image is not None and old_image.size > 0:
-                # Maintain constant size
+            if self.constant_size:
+                # Use constant size (width, height tuple)
+                target_width, target_height = self.constant_size
+            elif old_image is not None and old_image.size > 0:
+                # For dynamic layers that already have an image, maintain size if it exists
+                # (This case shouldn't normally happen, but we handle it gracefully)
                 target_height, target_width = old_image.shape[:2]
             else:
                 # Use new region size
@@ -410,49 +433,6 @@ class RenderLayer:
             
             # Update image
             self.image = new_image
-    
-    def get_screen_region(self):
-        """Get the absolute screen region for this layer as (left, top, width, height).
-        
-        Returns the current region if constant_size is True, otherwise calculates
-        a new region centered on the mouse.
-        
-        Returns:
-            Region: (left, top, width, height) in screen coordinates
-        """
-        with self.image_lock:
-            if self.constant_size and self.current_region.width > 0:
-                # Return the stored current region for constant size layers
-                return self.current_region
-            
-            # Calculate new region centered on mouse
-            mouse_x, mouse_y = self.plugin.get_mouse_position()
-            
-            # Get image dimensions safely
-            if self.image.size > 0:
-                if len(self.image.shape) >= 2:
-                    height, width = self.image.shape[:2]
-                else:
-                    width = height = 0
-            else:
-                width = height = 0
-            
-            if width == 0 or height == 0:
-                # No valid image, use default or plugin capture region size
-                if self.plugin:
-                    width = self.plugin.capture_region_width
-                    height = self.plugin.capture_region_height
-                else:
-                    width = height = 100
-            
-            # Center region on mouse position
-            half_width = width // 2
-            half_height = height // 2
-            
-            left = mouse_x - half_width
-            top = mouse_y - half_height
-            
-            return Region(left, top, width, height)
     
 class SemanticLayer(RenderLayer):
     """Render layer that stores semantic segmentation labels for each pixel."""

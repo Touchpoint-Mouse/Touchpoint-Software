@@ -16,12 +16,12 @@ import sys
 import os
 import ctypes
 from .utils import logMessage, logUIElement
-from .handlers import ObjectHandlerManager, GlobalHandlerManager
-from .render_config import initialize_render_config
+from .render_pipeline import RenderPipeline
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
 from .emulator_gui import TouchpointEmulatorGUI
 from .render_layers import Region
+from .config import TouchpointConfig
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -48,32 +48,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Emulator GUI
         self.emulator_gui = TouchpointEmulatorGUI()
         
-        # Initialize render configuration (layers, renderers, handlers)
-        renderLayerList, rendererList, objectHandlerList, globalHandlerList = initialize_render_config(self)
+        # Get centralized configuration (singleton - only created once)
+        self.config = TouchpointConfig.get_instance()
+        capture_width, capture_height = self.config.capture_dimensions
         
-        # Object handler manager
-        self.objectHandlers = ObjectHandlerManager(self)
-        self.objectHandlers.populate(objectHandlerList)
-            
-        # Global handler manager
-        self.globalHandlers = GlobalHandlerManager(self)
-        self.globalHandlers.populate(globalHandlerList)
+        # Initialize render pipeline (includes handler managers)
+        self.render_pipeline = RenderPipeline(self)
         
-        # Capture region configuration - centered on mouse with fixed size
-        self.capture_region_width = 100
-        self.capture_region_height = 100
+        # Capture region configuration - centered on mouse with size from software config
+        self.capture_region_width = capture_width
+        self.capture_region_height = capture_height
         
-        # Render layers and renderers
-        self.renderLayers = renderLayerList
-        for layer in self.renderLayers:
-            layer.set_plugin(self)
-            # Initialize with first region bounds
-            initial_region = Region(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
-            layer.update_region_bounds(initial_region)
-            
-        self.renderers = rendererList
-        for renderer in self.renderers:
-            renderer.set_plugin(self)
+        # Initialize all layers with starting region bounds
+        initial_region = Region(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
+        self.render_pipeline.update_layer_regions(initial_region)
         
         # Render thread
         self.render_thread = None
@@ -105,12 +93,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Initialize hardware driver
             self.hardware.initialize()
             
-            # Initialize renderers if needed (currently they are just data containers, but this is where setup would go)
-            for renderer in self.renderers:
-                renderer.initialize()
+            # Initialize renderers
+            self.render_pipeline.initialize_renderers()
             
             # Initialize emulator with layer IDs and aspect ratio
-            layer_ids = [layer.id for layer in self.renderLayers]
+            layer_ids = self.render_pipeline.get_layer_ids()
             aspect_ratio = self.capture_region_width / self.capture_region_height
             self.emulator_gui.initialize_layers(layer_ids, aspect_ratio)
             
@@ -153,29 +140,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 # Update mouse position variable
                 self.mouse_position = current_pos
             
-            # Update region bounds for all layers before running renderers
-            for layer in self.renderLayers:
-                # Calculate new region centered on current mouse position
-                new_region = Region(
-                    left=current_pos[0] - self.capture_region_width // 2,
-                    top=current_pos[1] - self.capture_region_height // 2,
-                    width=self.capture_region_width,
-                    height=self.capture_region_height
-                )
-                layer.update_region_bounds(new_region)
-                
-            # Execute renderers in order
-            for renderer in self.renderers:
-                renderer()
+            # Calculate new region centered on current mouse position
+            new_region = Region(
+                left=current_pos[0] - self.capture_region_width // 2,
+                top=current_pos[1] - self.capture_region_height // 2,
+                width=self.capture_region_width,
+                height=self.capture_region_height
+            )
+            
+            # Update region bounds and execute render cycle
+            self.render_pipeline.update_layer_regions(new_region)
+            self.render_pipeline.execute_render_cycle()
                 
             # Update emulator with layer images if emulator is open
             if self.emulator_gui.is_window_open():
-                for layer in self.renderLayers:
+                for layer in self.render_pipeline.get_layers():
                     self.emulator_gui.update_layer_image(layer.id, layer.image)
-                    layer.cycle_state()  # Cycle layer state for next frame
+                self.render_pipeline.cycle_layer_states()
             
             # Run global handlers
-            self.globalHandlers.dispatch_events()
+            self.render_pipeline.dispatch_handlers()
                     
             # Cycle hardware state machine
             self.hardware.cycle_state()
@@ -204,7 +188,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "gainFocus")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('gainFocus', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('gainFocus', obj)
         nextHandler()
 
     def event_loseFocus(self, obj, nextHandler):
@@ -217,7 +201,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "loseFocus")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('loseFocus', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('loseFocus', obj)
         nextHandler()
 
     def event_foreground(self, obj, nextHandler):
@@ -230,7 +214,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "foreground")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('foreground', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('foreground', obj)
         nextHandler()
 
     def event_nameChange(self, obj, nextHandler):
@@ -243,7 +227,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "nameChange")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('nameChange', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('nameChange', obj)
         nextHandler()
 
     def event_valueChange(self, obj, nextHandler):
@@ -256,7 +240,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "valueChange")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('valueChange', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('valueChange', obj)
         nextHandler()
 
     def event_stateChange(self, obj, nextHandler):
@@ -269,7 +253,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "stateChange")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('stateChange', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('stateChange', obj)
         nextHandler()
 
     def event_selection(self, obj, nextHandler):
@@ -282,7 +266,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "selection")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('selection', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('selection', obj)
         nextHandler()
 
     def event_mouseMove(self, obj, nextHandler, x=None, y=None):
@@ -308,7 +292,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logMessage(f"Typed character: {ch}")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('typedCharacter', obj, ch=ch)
+        self.render_pipeline.object_handler_manager.dispatch_event('typedCharacter', obj, ch=ch)
         nextHandler()
 
     def event_caret(self, obj, nextHandler):
@@ -333,7 +317,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "menuStart")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('menuStart', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('menuStart', obj)
         nextHandler()
 
     def event_menuEnd(self, obj, nextHandler):
@@ -346,7 +330,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "menuEnd")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('menuEnd', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('menuEnd', obj)
         nextHandler()
 
     def event_alert(self, obj, nextHandler):
@@ -359,7 +343,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "alert")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('alert', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('alert', obj)
         nextHandler()
 
     def event_documentLoadComplete(self, obj, nextHandler):
@@ -372,7 +356,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "documentLoadComplete")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('documentLoadComplete', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('documentLoadComplete', obj)
         nextHandler()
         
     def event_scrollPositionChanged(self, obj, nextHandler):
@@ -385,7 +369,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         # logUIElement(obj, "scrollPositionChanged")
         # Calls matching object handlers
-        self.objectHandlers.dispatch_event('scrollPositionChanged', obj)
+        self.render_pipeline.object_handler_manager.dispatch_event('scrollPositionChanged', obj)
         nextHandler()
     
     # Script to open emulator GUI
@@ -394,7 +378,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         ui.message("Opening Touchpoint emulator")
         
         # Ensure emulator is initialized with latest layer info
-        layer_ids = [layer.id for layer in self.renderLayers]
+        layer_ids = self.render_pipeline.get_layer_ids()
         aspect_ratio = self.capture_region_width / self.capture_region_height
         self.emulator_gui.initialize_layers(layer_ids, aspect_ratio)
         

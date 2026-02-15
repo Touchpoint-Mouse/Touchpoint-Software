@@ -9,12 +9,12 @@
         "port": "COM6",
         "baud_rate": 460800
     },
+    "display": {
+        "aspect_ratio": 0.5,
+        "resolution": 36.0
+    },
     "elevation": {
         "max_elevation": 180,
         "max_elevation_speed": 180
-    },
-    "texture": {
-        "aspect_ratio": 0.5,
-        "texture_resolution": 36.0
     }
 }

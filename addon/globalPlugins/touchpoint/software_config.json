@@ -1,0 +1,10 @@
+{
+  "capture_region": {
+    "area": 10000,
+    "aspect_ratio": 1.0
+  },
+  "layer_multipliers": {
+    "depth": 4.0,
+    "texture": 1.0
+  }
+}
