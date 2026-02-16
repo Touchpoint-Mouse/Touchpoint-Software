@@ -7,9 +7,11 @@ from .utils import logMessage
 from .render_layers import (
     RenderLayer,
     SemanticLayer,
+    ObjectTreeLayer,
     CaptureRenderer,
-    ObjectRenderer,
+    ObjectTreeRenderer,
     DepthRenderer,
+    ObjectDepthRenderer,
     ElevationRenderer
 )
 from .effects import ComboEffect, GlobalElevationEffect, VibrationEffect
@@ -49,7 +51,7 @@ class RenderPipeline:
         layer_dims = self.config.layer_dimensions
         
         self.capture_layer = RenderLayer(id="capture", dtype=np.uint8, num_channels=3)  # BGR color
-        self.object_layer = SemanticLayer(id="object", constant_size=None)  # Dynamic size follows capture region
+        self.object_tree_layer = ObjectTreeLayer(id="object_tree")  # Dynamic size follows capture region
         self.depth_layer = RenderLayer(id="depth", dtype=np.uint8, constant_size=layer_dims['depth'], num_channels=1)  # Grayscale
         self.texture_layer = RenderLayer(id="texture", dtype=np.uint8, constant_size=layer_dims['texture'])  # BGR color
         
@@ -60,8 +62,9 @@ class RenderPipeline:
     def _create_renderers(self):
         """Create renderers that operate on layers."""
         self.capture_renderer = CaptureRenderer(self.capture_layer)
-        self.object_renderer = ObjectRenderer(self.capture_layer, self.object_layer)
-        self.depth_renderer = DepthRenderer(self.capture_layer, self.depth_layer)
+        self.object_tree_renderer = ObjectTreeRenderer(self.capture_layer, self.object_tree_layer)
+        self.depth_renderer = DepthRenderer(self.capture_layer, self.depth_layer)  # DISABLED
+        self.object_depth_renderer = ObjectDepthRenderer(self.object_tree_layer, self.depth_layer)
         self.elevation_renderer = ElevationRenderer(self.depth_layer)
         
         # Set plugin reference for all renderers
@@ -130,7 +133,7 @@ class RenderPipeline:
         """
         return [
             self.capture_layer,
-            self.object_layer,
+            self.object_tree_layer,
             self.depth_layer,
             self.texture_layer
         ]
@@ -143,8 +146,9 @@ class RenderPipeline:
         """
         return [
             self.capture_renderer,
-            self.object_renderer,
-            self.depth_renderer,
+            self.object_tree_renderer,
+            # self.depth_renderer,  # DISABLED - using object_depth_renderer instead
+            self.object_depth_renderer,
             self.elevation_renderer
         ]
     

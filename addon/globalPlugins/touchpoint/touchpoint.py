@@ -32,9 +32,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     for haptic feedback based on screen depth maps.
     """
     
-    # Event checking and rendering interval
-    RENDER_INTERVAL = 0.01
-    
     def __init__(self):
         """Initialize the global plugin."""
         super(GlobalPlugin, self).__init__()
@@ -165,7 +162,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                     
             # Cycle hardware state machine
             self.hardware.cycle_state()
-            time.sleep(self.RENDER_INTERVAL)
+            time.sleep(self.config.software['threading']['render'])
     
     def terminate(self):
         """Clean up when the plugin is terminated."""

@@ -87,7 +87,8 @@ class TouchpointConfig:
             # Return defaults
             return {
                 "capture_region": {"area": 10000, "aspect_ratio": 1.0},
-                "layer_multipliers": {"depth": 4.0, "texture": 1.0}
+                "layer_multipliers": {"depth": 4.0, "texture": 1.0},
+                "threading": {"capture": 0.01, "render": 0.01}
             }
     
     def _validate_config(self):
@@ -105,6 +106,9 @@ class TouchpointConfig:
             
             for layer_name, multiplier in self.software['layer_multipliers'].items():
                 assert multiplier > 0, f"Layer multiplier for '{layer_name}' must be positive"
+                
+            for layer_name, multiplier in self.software['threading'].items():
+                assert multiplier > 0, f"Thread delay for '{layer_name}' must be positive"
                 
         except AssertionError as e:
             logMessage(f"[ERROR] Configuration validation failed: {e}")

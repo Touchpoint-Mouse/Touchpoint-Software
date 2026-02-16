@@ -42,6 +42,7 @@ class CaptureRenderer(Renderer):
         self.enabled = False
         self.camera_thread = None
         self.capture_image = None
+        self.capture_region = None  # Store region that corresponds to captured image
         self.capture_lock = threading.Lock()
         
     def initialize(self):
@@ -51,19 +52,44 @@ class CaptureRenderer(Renderer):
         self.camera_thread.start()
     
     def __call__(self):
-        """Update the layer image with the latest captured screen region."""
+        """Update the layer image by cropping from the large captured buffer to the desired region."""
         with self.capture_lock:
-            if self.capture_image is not None:
-                self.layer.update_image(self.capture_image)
+            if self.capture_image is None or self.capture_region is None:
+                return
+            
+            large_capture = self.capture_image
+            large_region = self.capture_region
+        
+        # Get the desired region (set by update_region_bounds)
+        desired_region = self.layer.current_region
+        
+        # Calculate crop bounds: where desired_region sits within large_region
+        crop_x = desired_region.left - large_region.left
+        crop_y = desired_region.top - large_region.top
+        crop_x_end = crop_x + desired_region.width
+        crop_y_end = crop_y + desired_region.height
+        
+        # Clamp crop bounds to large capture dimensions
+        crop_x = max(0, min(crop_x, large_capture.shape[1]))
+        crop_y = max(0, min(crop_y, large_capture.shape[0]))
+        crop_x_end = max(0, min(crop_x_end, large_capture.shape[1]))
+        crop_y_end = max(0, min(crop_y_end, large_capture.shape[0]))
+        
+        # Crop the image
+        if crop_x < crop_x_end and crop_y < crop_y_end:
+            cropped_image = large_capture[crop_y:crop_y_end, crop_x:crop_x_end]
+            self.layer.update_image(cropped_image)
     
     def terminate(self):
         """Terminate the camera thread and release resources."""
         self.enabled = False
 
     def _camera_thread(self):
-        """Thread to continuously capture screen region and update layer image.
+        """Thread to continuously capture a large screen region with padding.
         
-        Creates mss instance in this thread since mss uses thread-local storage.
+        Captures a larger buffer than needed, so __call__() can crop to the exact region
+        requested by update_region_bounds. Creates mss instance in this thread since 
+        mss uses thread-local storage.
         """
         # Create mss instance in this thread (required due to thread-local storage)
         try:
@@ -78,19 +104,29 @@ class CaptureRenderer(Renderer):
                 return
                 
             try:
-                # Get region from layer's current region
+                # Get desired region and add padding for larger capture buffer
                 region = self.layer.current_region
-                left, top, width, height = region.left, region.top, region.width, region.height
+                
+                # Get padding from config (default to 100 pixels if not set)
+                padding = 100
+                if self.plugin and hasattr(self.plugin, 'config'):
+                    padding = self.plugin.config.software.get('capture_padding', 100)
+                
+                # Calculate padded region
+                padded_left = region.left - padding
+                padded_top = region.top - padding
+                padded_width = region.width + 2 * padding
+                padded_height = region.height + 2 * padding
                 
                 # Get screen size
                 screen_width, screen_height = self.plugin.get_screen_size()
                 
-                # Clamps region to screen size
+                # Clamp padded region to screen bounds
                 monitor = {
-                    "left": max(left, 0),
-                    "top": max(top, 0),
-                    "width": min(width, screen_width - left),
-                    "height": min(height, screen_height - top)
+                    "left": max(padded_left, 0),
+                    "top": max(padded_top, 0),
+                    "width": min(padded_width, screen_width - max(padded_left, 0)),
+                    "height": min(padded_height, screen_height - max(padded_top, 0))
                 }
                 
                 screenshot = camera.grab(monitor)
@@ -101,294 +137,253 @@ class CaptureRenderer(Renderer):
                 frame = np.array(screenshot)
                 
                 # mss returns BGRA, extract BGR channels
-                frame = frame[:, :, :3]
+                captured_image = frame[:, :, :3]
                 
-                # Creates empty array with the current image size
-                new_image = np.zeros((height, width, 3), dtype=np.uint8)
+                # Store the captured region (not the desired region)
+                captured_region = Region(
+                    left=monitor["left"],
+                    top=monitor["top"],
+                    width=monitor["width"],
+                    height=monitor["height"]
+                )
                 
-                # Calculate offsets for placing the captured frame in the new image
-                x_start = max(0, -left)
-                y_start = max(0, -top)
-                x_end = x_start + monitor["width"]
-                y_end = y_start + monitor["height"]
-                
-                new_image[y_start:y_end, x_start:x_end] = frame
-                
+                # Store both image and the region it corresponds to atomically
                 with self.capture_lock:
-                    self.capture_image = new_image
+                    self.capture_image = captured_image
+                    self.capture_region = captured_region
             except Exception as e:
                 logMessage(f"[ERROR] CaptureRenderer failed: {e}")
-                time.sleep(0.01)  # Small delay to prevent excessive CPU usage
-                
-class ObjectRenderer(Renderer):
-    """Renderer that finds unique NVDA objects using a mesh grid and updates layer image with object labels."""
-    def __init__(self, capture_layer, object_layer):
+            
+        time.sleep(self.plugin.config.software['threading']['capture'])  # Small delay to prevent excessive CPU usage
+        
+class ObjectTreeRenderer(Renderer):
+    """Renderer that finds unique NVDA objects using a mesh grid and updates the object tree layer."""
+    def __init__(self, capture_layer, object_tree_layer):
         """Initialize with layer reference.
         
         Args:
             capture_layer: CaptureLayer to read from
-            object_layer: SemanticLayer to write object labels to
+            object_tree_layer: ObjectTreeLayer to write object labels to
         """
         self.capture_layer = capture_layer
-        self.object_layer = object_layer
-    
-    def _is_duplicate(self, obj, existing_objects, iou_threshold=0.8):
-        """Check if an object is a duplicate based on IoU (Intersection over Union).
-        
-        Args:
-            obj: NVDA object to check
-            existing_objects: List of objects already detected
-        Returns:
-            bool: True if object is a duplicate, False otherwise
-        """
-        try:
-            if not hasattr(obj, 'location') or obj.location is None:
-                return False
-                
-            obj_location = obj.location
-            obj_left = obj_location.left
-            obj_top = obj_location.top
-            obj_right = obj_left + obj_location.width
-            obj_bottom = obj_top + obj_location.height
-            obj_area = obj_location.width * obj_location.height
-            
-            if obj_area == 0:
-                return False
-            
-            for obj_info in existing_objects:
-                existing_location = obj_info.get('location')
-                if existing_location is None:
-                    continue
-                
-                # Calculate intersection
-                ex_left = existing_location.left
-                ex_top = existing_location.top
-                ex_right = ex_left + existing_location.width
-                ex_bottom = ex_top + existing_location.height
-                ex_area = existing_location.width * existing_location.height
-                
-                if ex_area == 0:
-                    continue
-                
-                # Intersection rectangle
-                int_left = max(obj_left, ex_left)
-                int_top = max(obj_top, ex_top)
-                int_right = min(obj_right, ex_right)
-                int_bottom = min(obj_bottom, ex_bottom)
-                
-                # Check if there's any intersection
-                if int_right > int_left and int_bottom > int_top:
-                    int_area = (int_right - int_left) * (int_bottom - int_top)
-                    union_area = obj_area + ex_area - int_area
-                    iou = int_area / union_area if union_area > 0 else 0
-                    
-                    # If IoU is high enough, consider it a duplicate
-                    if iou > iou_threshold:
-                        return True
-                    
-        except Exception as e:
-            logMessage(f"[ERROR] Duplicate checking failed: {e}")
-            
-        return False
+        self.object_tree_layer = object_tree_layer
+        self.iou_threshold = 0.8
         
     def __call__(self):
-        """Find unique NVDA objects using a mesh grid and update layer image with object labels."""
+        """Find unique NVDA objects using a mesh grid and update the object tree layer."""
         try:
             # Get capture layer difference mask to determine which regions have changed
             diff_mask = self.capture_layer.get_diff_mask()
             
-            # Log for debugging
-            logMessage(f"[ObjectRenderer] diff_mask.size={diff_mask.size}, has_changes={np.any(diff_mask) if diff_mask.size > 0 else 'N/A'}")
-            
             if diff_mask.size == 0 or not np.any(diff_mask):
-                logMessage("[ObjectRenderer] No changes detected, skipping object detection")
                 return  # No changes, skip processing
             
             # Get current capture region
             region = self.capture_layer.current_region
-            logMessage(f"[ObjectRenderer] Processing region: left={region.left}, top={region.top}, width={region.width}, height={region.height}")
             
             # Get object mesh dimensions from config
             if not self.plugin or not hasattr(self.plugin, 'config'):
-                logMessage("[ObjectRenderer] No plugin or config available")
+                logMessage("[ObjectTreeRenderer] No plugin or config available")
                 return
                 
             mesh_dims = self.plugin.config.layer_dimensions.get('object_mesh')
             if mesh_dims is None:
-                logMessage("[ObjectRenderer] No object_mesh dimensions in config")
+                logMessage("[ObjectTreeRenderer] No object_mesh dimensions in config")
                 return
                 
             mesh_width, mesh_height = mesh_dims
-            logMessage(f"[ObjectRenderer] Mesh dimensions: {mesh_width}x{mesh_height}")
             
-            # Get current object layer image to check which pixels belong to which objects
-            current_object_image = self.object_layer.get_image()
-            
-            # Invalidate objects whose actual pixels have changed in the diff_mask
-            labels_to_remove = []
+            # Invalidate objects whose actual pixels have changed using breadth-first traversal
+            # Remove labels immediately during traversal so we skip checking children of removed nodes
+            current_object_image = self.object_tree_layer.get_image()
             img_height, img_width = diff_mask.shape[:2]
+            labels_removed = 0
             
-            for label, obj_info in self.object_layer.semantic_map.items():
-                location = obj_info.get('location')
-                if location is None:
-                    continue
-                
-                # Convert object location to capture-layer-relative coordinates
-                obj_left = location.left - region.left
-                obj_top = location.top - region.top
-                obj_right = obj_left + location.width
-                obj_bottom = obj_top + location.height
-                
-                # Clamp to image bounds
-                obj_left_clamped = max(0, min(obj_left, img_width))
-                obj_top_clamped = max(0, min(obj_top, img_height))
-                obj_right_clamped = max(0, min(obj_right, img_width))
-                obj_bottom_clamped = max(0, min(obj_bottom, img_height))
-                
-                # If clamped region has zero size, object is completely outside bounds - remove it
-                if obj_right_clamped <= obj_left_clamped or obj_bottom_clamped <= obj_top_clamped:
-                    labels_to_remove.append(label)
-                    continue
-                
-                # Extract the bounding box region from both object layer and diff_mask
-                object_region = current_object_image[obj_top_clamped:obj_bottom_clamped, obj_left_clamped:obj_right_clamped]
-                diff_region = diff_mask[obj_top_clamped:obj_bottom_clamped, obj_left_clamped:obj_right_clamped]
-                
-                # Find pixels that belong to this specific object (where pixel value == label)
-                object_pixels_mask = (object_region == label)
-                
-                # Check if any of the object's actual pixels have changed in the diff_mask
-                if np.any(object_pixels_mask & diff_region):
-                    labels_to_remove.append(label)
+            # Collect redraw actions during invalidation to execute after mesh grid scan
+            # This prevents redraws from filling pixels and blocking mesh grid detection
+            redraw_actions = []
             
-            # Remove invalidated labels from semantic map and clear from layer image
-            for label in labels_to_remove:
-                self.object_layer.remove_label(label)
+            # Import occlusion checking function
+            from .utils import is_window_occluded
             
-            # Now get working copy AFTER invalidation - it won't have the cleared pixels
-            new_image = self.object_layer.get_image()
+            # Traverse all window trees to check for invalidation
+            for hwnd, window_tree in list(self.object_tree_layer.window_trees.items()):
+                for node in self.object_tree_layer.BreadthFirstIterator(window_tree, skip_root=True):
+                    # Skip if this node was already removed as part of a parent's subtree
+                    if node.label not in self.object_tree_layer.label_map:
+                        continue
+                    
+                    location = node.obj_info.get('location')
+                    if location is None:
+                        continue
+                    
+                    # Check if this object is completely occluded by windows in front
+                    if is_window_occluded(hwnd, location):
+                        self.object_tree_layer.remove_label(node.label)
+                        labels_removed += 1
+                        logMessage(f"[ObjectTreeRenderer] Removed occluded label {node.label} from window {hwnd}")
+                        continue
+                    
+                    # Convert object location to capture-layer-relative coordinates
+                    obj_left = location.left - region.left
+                    obj_top = location.top - region.top
+                    obj_right = obj_left + location.width
+                    obj_bottom = obj_top + location.height
+                    
+                    # Check if object is too far outside capture bounds (with configurable threshold)
+                    # Calculate distance from object to capture region (0 if they overlap)
+                    if obj_right <= 0:
+                        # Object is to the left
+                        distance = -obj_right
+                    elif obj_left >= img_width:
+                        # Object is to the right
+                        distance = obj_left - img_width
+                    elif obj_bottom <= 0:
+                        # Object is above
+                        distance = -obj_bottom
+                    elif obj_top >= img_height:
+                        # Object is below
+                        distance = obj_top - img_height
+                    else:
+                        # Object overlaps with capture region
+                        distance = 0
+                    
+                    # Get distance threshold from config (default 200 pixels)
+                    distance_threshold = 200
+                    if self.plugin and hasattr(self.plugin, 'config'):
+                        distance_threshold = self.plugin.config.software.get('object_invalidation_distance', 200)
+                    
+                    # Remove object if it exceeds the distance threshold
+                    if distance > distance_threshold:
+                        self.object_tree_layer.remove_label(node.label)
+                        labels_removed += 1
+                        logMessage(f"[ObjectTreeRenderer] Removed out-of-bounds label {node.label} (distance={distance:.0f}px)")
+                        continue
+                    
+                    # Clamp to image bounds
+                    obj_left_clamped = max(0, obj_left)
+                    obj_top_clamped = max(0, obj_top)
+                    obj_right_clamped = min(img_width, obj_right)
+                    obj_bottom_clamped = min(img_height, obj_bottom)
+                    
+                    # If clamped region has zero size, object is completely outside but within threshold
+                    # Skip processing but don't remove (will be cleared by distance check on future frames)
+                    if obj_right_clamped <= obj_left_clamped or obj_bottom_clamped <= obj_top_clamped:
+                        continue
+                    
+                    # Extract the bounding box region from both object layer and diff_mask
+                    object_region = current_object_image[obj_top_clamped:obj_bottom_clamped, obj_left_clamped:obj_right_clamped]
+                    diff_region = diff_mask[obj_top_clamped:obj_bottom_clamped, obj_left_clamped:obj_right_clamped]
+                    
+                    # Find pixels that belong to this specific object (where pixel value == label)
+                    object_pixels_mask = (object_region == node.label)
+                    
+                    # Count how many object pixels have changed
+                    changed_object_pixels = np.sum(object_pixels_mask & diff_region)
+                    total_object_pixels = np.sum(object_pixels_mask)
+                    
+                    # Only invalidate if significant portion of object pixels changed (>50% threshold)
+                    # This prevents invalidation from minor visual updates like highlights, focus indicators, etc.
+                    if total_object_pixels > 0:
+                        change_ratio = changed_object_pixels / total_object_pixels
+                        if change_ratio > 0.50:
+                            self.object_tree_layer.remove_label(node.label)
+                            labels_removed += 1
+                            logMessage(f"[ObjectTreeRenderer] Removed invalidated label {node.label} (changed {change_ratio*100:.1f}%)")
+                        else:
+                            # Object not invalidated - queue redraw to update visible bounding box
+                            # This handles cases where object is at edge and region shifted
+                            redraw_actions.append((node.label, location))
+                    else:
+                        # Object has no current pixels but is now in visible bounds
+                        # This happens when object was outside capture region and has now re-entered
+                        # Queue redraw to make it visible again
+                        redraw_actions.append((node.label, location))
+            
+            # Get fresh object image after invalidation for mesh grid detection
+            # This ensures mesh grid can detect objects where labels were just removed
+            current_object_image = self.object_tree_layer.get_image()
             
             # Create mesh grid for object detection
-            # Generate evenly spaced points across the capture region (excluding endpoints to stay in bounds)
+            # Generate evenly spaced points across the capture region including edges
+            # linspace includes both endpoints, so edges are covered
             x_points = np.linspace(region.left, region.left + region.width - 1, mesh_width, dtype=int)
             y_points = np.linspace(region.top, region.top + region.height - 1, mesh_height, dtype=int)
             
-            # Get list of existing objects for duplicate checking
-            existing_objects = list(self.object_layer.semantic_map.values())
+            # Collect drawing actions during mesh scan to execute at the end
+            # This prevents large parent objects from overwriting children during the scan
             
-            objects_detected = 0
-            points_checked = 0
-            points_already_labeled = 0
-            points_no_object = 0
-            points_no_location = 0
-            points_too_small = 0
-            points_duplicate = 0
-            points_exception = 0
+            # Gets screen bounds for occlusion checking during mesh scan
+            screen_width, screen_height = self.plugin.get_screen_size()
             
             # Loop through mesh grid and detect unique objects
             for y in y_points:
                 for x in x_points:
-                    points_checked += 1
+                    # Checks to ensure global coordinates are within screen bounds
+                    if y < 0 or y >= screen_height or x < 0 or x >= screen_width:
+                        continue
+                    
                     # Continue if this point already has a label in the working image (skip to next point)
                     y_rel = y - region.top
                     x_rel = x - region.left
-                    pixel_value = new_image[y_rel, x_rel]
-                    if np.any(pixel_value != 0):
-                        points_already_labeled += 1
+                    
+                    pixel_value = current_object_image[y_rel, x_rel]
+                    if pixel_value != 0:
                         continue
+                    
                     try:
                         # Get NVDA object at this screen position
                         obj = NVDAObjects.NVDAObject.objectFromPoint(int(x), int(y))
                         
                         # Skip if no object or object has no location (can't label it)
                         if obj is None:
-                            points_no_object += 1
                             continue
                         
                         if not hasattr(obj, 'location') or obj.location is None:
-                            points_no_location += 1
                             continue
                         
-                        # Skip if any of the object's dimensions are smaller than the mesh grid cell size (to avoid labeling tiny objects that won't be reliably detected)
+                        # Skip if any of the object's dimensions are smaller than the mesh grid cell size
                         cell_width = region.width / mesh_width
                         cell_height = region.height / mesh_height
                         if obj.location.width < cell_width or obj.location.height < cell_height:
-                            points_too_small += 1
-                            logMessage(f"[ObjectRenderer] Skipping small object at ({x},{y}): size={obj.location.width}x{obj.location.height}, cell_size={cell_width:.1f}x{cell_height:.1f}")
                             continue
                         
-                        # Check if this object is a duplicate of an already known object
-                        if self._is_duplicate(obj, existing_objects):
-                            points_duplicate += 1
-                            continue
-                        
-                        # Add to semantic map
+                        # Create obj_info dictionary
                         obj_info = {
                             'name': obj.name if hasattr(obj, 'name') else 'Unknown',
                             'role': obj.role if hasattr(obj, 'role') else None,
-                            'location': obj.location if hasattr(obj, 'location') else None,
-                            'object': obj  # Keep reference for handlers
+                            'location': obj.location,
+                            'object': obj
                         }
-                        existing_objects.append(obj_info)
-                        new_label = self.object_layer.add_label(obj_info)
-                        objects_detected += 1
                         
-                        # Get role name for logging
-                        role_name = "Unknown"
-                        try:
-                            if hasattr(obj, 'role') and obj.role is not None:
-                                import controlTypes
-                                role_name = controlTypes.Role(obj.role).name if hasattr(controlTypes, 'Role') else str(obj.role)
-                        except:
-                            role_name = str(obj.role) if hasattr(obj, 'role') else "Unknown"
+                        # Add to tree layer immediately (handles duplicate checking via tree comparison)
+                        new_label = self.object_tree_layer.add_label(obj_info)
                         
-                        # Get window class if available
-                        window_class = getattr(obj, 'windowClassName', '') if hasattr(obj, 'windowClassName') else ''
-                        
-                        logMessage(f"[ObjectRenderer] Detected object: label={new_label}, name='{obj_info['name']}', role={role_name}, class='{window_class}', location=({obj.location.left},{obj.location.top},{obj.location.width},{obj.location.height})")
-                        
-                        # Fill object region with label immediately
-                        if hasattr(obj, 'location') and obj.location is not None:
-                            location = obj.location
+                        if new_label > 0:
+                            # Get role name for logging
+                            role_name = "Unknown"
+                            try:
+                                if 'role' in obj_info and obj_info['role'] is not None:
+                                    import controlTypes
+                                    role_name = controlTypes.Role(obj_info['role']).name if hasattr(controlTypes, 'Role') else str(obj_info['role'])
+                            except:
+                                role_name = str(obj_info['role']) if 'role' in obj_info else "Unknown"
                             
-                            # Convert to capture-layer-relative coordinates
-                            obj_left = location.left - region.left
-                            obj_top = location.top - region.top
-                            obj_width = location.width
-                            obj_height = location.height
+                            logMessage(f"[ObjectTreeRenderer] Detected object: label={new_label}, name='{obj_info['name']}', role={role_name}, location=({obj_info['location'].left},{obj_info['location'].top},{obj_info['location'].width},{obj_info['location'].height})")
                             
-                            # Clamp to image bounds
-                            img_height, img_width = new_image.shape[:2]
-                            x1 = max(0, min(int(obj_left), img_width))
-                            y1 = max(0, min(int(obj_top), img_height))
-                            x2 = max(0, min(int(obj_left + obj_width), img_width))
-                            y2 = max(0, min(int(obj_top + obj_height), img_height))
-                            
-                            # Fill object region with label (only unlabeled pixels to avoid overwriting existing labels)
-                            if x2 > x1 and y2 > y1:
-                                region_slice = new_image[y1:y2, x1:x2]
-                                new_image[y1:y2, x1:x2] = np.where(region_slice == 0, new_label, region_slice)
+                            # Queue drawing for later (after mesh scan completes)
+                            redraw_actions.append((new_label, obj_info['location']))
                                 
                     except Exception as e:
-                        points_exception += 1
-                        logMessage(f"[ObjectRenderer] Exception at point ({x},{y}): {e}")
+                        pass  # Silently skip exceptions at individual points
             
-            logMessage(f"[ObjectRenderer] Detection summary:")
-            logMessage(f"  - Points checked: {points_checked}")
-            logMessage(f"  - Already labeled: {points_already_labeled}")
-            logMessage(f"  - No object: {points_no_object}")
-            logMessage(f"  - No location: {points_no_location}")
-            logMessage(f"  - Too small: {points_too_small}")
-            logMessage(f"  - Duplicate: {points_duplicate}")
-            logMessage(f"  - Exceptions: {points_exception}")
-            logMessage(f"  - Objects detected: {objects_detected}")
-            
-            # Update the layer image atomically at the end
-            self.object_layer.update_image(new_image)
-            logMessage(f"[ObjectRenderer] Updated object layer image with {objects_detected} objects")
+            # Execute all fill operations at once: redraws from invalidation + new detections
+            # This prevents early fills from blocking mesh grid detection
+            for label, location in redraw_actions:
+                self.object_tree_layer.fill_object_region(label, location, region)
                         
         except Exception as e:
-            logMessage(f"[ERROR] ObjectRenderer failed: {e}")
+            logMessage(f"[ERROR] ObjectTreeRenderer failed: {e}")
         
 
 class DepthRenderer(Renderer):
@@ -406,31 +401,93 @@ class DepthRenderer(Renderer):
         
     def __call__(self):
         """Compute depth map from capture layer and write to depth layer."""
+        # DISABLED: Using ObjectDepthRenderer instead
+        pass
+        # try:
+        #     # Read capture image with lock
+        #     capture_img = self.capture_layer.get_image()
+        #     if capture_img.size == 0:
+        #         return
+        #     
+        #     # Get padding from config
+        #     padding = self.plugin.config.capture_padding
+        #     
+        #     # Crop to hardware area (remove padding on all sides)
+        #     if padding > 0:
+        #         h, w = capture_img.shape[:2]
+        #         capture_img = capture_img[padding:h-padding, padding:w-padding]
+        #     
+        #     # Simple depth map: convert to grayscale and normalize
+        #     # In a real implementation, this would use stereo vision or other depth estimation
+        #     gray = cv2.cvtColor(capture_img, cv2.COLOR_BGR2GRAY)
+        #     
+        #     # Normalize to 0-max elevation range (treating brightness as depth)
+        #     depth_map = cv2.normalize(gray, None, 0, self.plugin.hardware.get_max_elevation(), cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+        #     
+        #     # Write to depth layer
+        #     self.depth_layer.update_image(depth_map)
+        # except Exception as e:
+        #     logMessage(f"[ERROR] DepthRenderer failed: {e}")
+
+class ObjectDepthRenderer(Renderer):
+    """Renderer that reads from object tree layer and writes scaled depth to depth layer."""
+    
+    def __init__(self, object_tree_layer, depth_layer):
+        """Initialize with references to object tree and depth layers.
+        
+        Args:
+            object_tree_layer: ObjectTreeLayer to read object labels from
+            depth_layer: DepthLayer to write depth values to
+        """
+        self.object_tree_layer = object_tree_layer
+        self.depth_layer = depth_layer
+        
+    def __call__(self):
+        """Convert object labels to scaled depth values and write to depth layer."""
         try:
-            # Read capture image with lock
-            capture_img = self.capture_layer.get_image()
-            if capture_img.size == 0:
+            # Get object layer image
+            object_img = self.object_tree_layer.get_image()
+            if object_img.size == 0:
                 return
             
-            # Get padding from config
+            # Get max elevation from hardware
+            max_elevation = self.plugin.hardware.get_max_elevation()
+            
+            # Create depth map with same dimensions as object layer
+            depth_map = np.zeros_like(object_img, dtype=np.uint8)
+            
+            # Scale object labels to depth values
+            # Higher labels (more in front) = higher depth values
+            # Label 0 (background) = 0 depth
+            # Max label = max_elevation
+            
+            # Find max label in use
+            max_label = np.max(object_img)
+            
+            if max_label > 0:
+                # Scale labels to depth range
+                # Use linear scaling: depth = (label / max_label) * max_elevation
+                mask = object_img > 0  # Non-background pixels
+                depth_map[mask] = ((object_img[mask].astype(np.float32) / max_label) * max_elevation).astype(np.uint8)
+            
+            # Get padding from config to crop to hardware area
             padding = self.plugin.config.capture_padding
             
             # Crop to hardware area (remove padding on all sides)
             if padding > 0:
-                h, w = capture_img.shape[:2]
-                capture_img = capture_img[padding:h-padding, padding:w-padding]
-            
-            # Simple depth map: convert to grayscale and normalize
-            # In a real implementation, this would use stereo vision or other depth estimation
-            gray = cv2.cvtColor(capture_img, cv2.COLOR_BGR2GRAY)
-            
-            # Normalize to 0-max elevation range (treating brightness as depth)
-            depth_map = cv2.normalize(gray, None, 0, self.plugin.hardware.get_max_elevation(), cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                h, w = depth_map.shape[:2]
+                if h > 2*padding and w > 2*padding:
+                    depth_map = depth_map[padding:h-padding, padding:w-padding]
+                else:
+                    logMessage(f"[ObjectDepthRenderer] Warning: depth map too small to crop padding {padding}")
             
             # Write to depth layer
             self.depth_layer.update_image(depth_map)
+            
         except Exception as e:
-            logMessage(f"[ERROR] DepthRenderer failed: {e}")
+            logMessage(f"[ERROR] ObjectDepthRenderer failed: {e}")
+            import traceback
+            logMessage(traceback.format_exc())
 
 class ElevationRenderer(Renderer):
     """Renderer that reads center pixel from depth layer and sets hardware elevation."""
@@ -712,5 +769,315 @@ class SemanticLayer(RenderLayer):
         label = self.next_label
         self.semantic_map[label] = obj_info
         self.next_label += 1
+        
+        # Wraparound label if we exceed 255 (max for uint8)
+        if self.next_label > 255:
+            self.next_label = 1
         return label
+    
+class ObjectTreeLayer(RenderLayer):
+    """Render layer that stores hierarchical object tree information with depth-based labels."""
+    class Node:
+        """Node class for representing objects in a tree structure."""
+        def __init__(self, label, obj_info, depth=0):
+            self.label = label  # Zero-aligned by depth
+            self.obj_info = obj_info
+            self.depth = depth
+            self.children = []
+            self.subtree_size = 1  # Number of nodes in this subtree (including self)
+            
+        def update_subtree_size(self):
+            """Recursively calculate subtree size."""
+            self.subtree_size = 1 + sum(child.update_subtree_size() for child in self.children)
+            return self.subtree_size
+            
+        def compare_to(self, other_node, duplicate_threshold=10):
+            """Compare this node to another node for tree construction within same window."""
+            try:
+                if 'location' not in self.obj_info or 'location' not in other_node.obj_info:
+                    return 0  # Can't compare without location
+                
+                loc1 = self.obj_info['location']
+                loc2 = other_node.obj_info['location']
+                
+                left1, top1, right1, bottom1 = loc1.left, loc1.top, loc1.left + loc1.width, loc1.top + loc1.height
+                left2, top2, right2, bottom2 = loc2.left, loc2.top, loc2.left + loc2.width, loc2.top + loc2.height
+                
+                # Check for duplicate (very similar bounding box)
+                if (abs(left1 - left2) < duplicate_threshold and abs(top1 - top2) < duplicate_threshold and 
+                    abs(right1 - right2) < duplicate_threshold and abs(bottom1 - bottom2) < duplicate_threshold):
+                    return None  # Duplicate object
+                
+                # Check if self is fully inside other (containment)
+                if left1 > left2 and top1 > top2 and right1 < right2 and bottom1 < bottom2:
+                    return -1  # self is child of other
+                
+                # Check if self is fully outside other (no overlap)
+                if right1 < left2 or left1 > right2 or bottom1 < top2 or top1 > bottom2:
+                    return 1  # self is sibling or unrelated
+                
+                # Objects overlap but neither contains the other - treat as siblings
+                return 0
+                
+            except Exception as e:
+                logMessage(f"[ERROR] Node comparison failed: {e}")
+                return 0
+    
+    class BreadthFirstIterator:
+        """Iterator for traversing the object tree in breadth-first order."""
+        def __init__(self, root, skip_root=False):
+            self.queue = [root] if (root and not skip_root) else ([] if not root else list(root.children))
+        
+        def __iter__(self):
+            return self
+        
+        def __next__(self):
+            if not self.queue:
+                raise StopIteration
+            current = self.queue.pop(0)
+            self.queue.extend(current.children)
+            return current
+            
+    def __init__(self, id, constant_size=None):
+        super().__init__(id, dtype=np.uint8, constant_size=constant_size, num_channels=1)
+        # Each window has its own independent tree
+        # Maps window handle (HWND) -> root Node
+        self.window_trees = {}
+        # Maps window handle -> z-order position (0 = topmost)
+        self.window_z_orders = {}
+        # Label-to-node mapping for fast lookup
+        self.label_map = {}
+        # Track next available label
+        self.next_label = 1
+        
+    def add_label(self, obj_info, parent_label=None):
+        """Add a new object label to the tree with depth-based label assignment.
+        
+        Args:
+            obj_info: Dictionary containing object information (name, role, location, etc.)
+            parent_label: Optional parent label to insert under (None = find automatically)
+        Returns:
+            int: The label assigned to this object
+        """
+        from .utils import get_object_window_handle, get_window_z_order
+        
+        # Get window handle for this object
+        obj = obj_info.get('object')
+        if not obj:
+            return 0
+        
+        hwnd = get_object_window_handle(obj)
+        if not hwnd:
+            return 0
+        
+        # Get or create tree for this window
+        if hwnd not in self.window_trees:
+            z_order = get_window_z_order(hwnd)
+            self.window_trees[hwnd] = self.Node(0, {'name': f'window_{hwnd}', 'hwnd': hwnd}, depth=0)
+            self.window_z_orders[hwnd] = z_order if z_order >= 0 else 999
+        
+        window_tree = self.window_trees[hwnd]
+        
+        # Create temporary node with placeholder label to find insertion point
+        temp_node = self.Node(0, obj_info)
+        
+        # Find parent node within this window's tree
+        if parent_label is not None and parent_label in self.label_map:
+            parent_node = self.label_map[parent_label]
+        else:
+            parent_node = self._find_parent(window_tree, temp_node)
+        
+        if parent_node is None:
+            return 0
+        
+        # Calculate label based on window z-order and position in tree
+        label = self._calculate_label_with_z_order(hwnd, parent_node)
+        
+        if label == 0:
+            return 0
+        
+        # Create and insert new node
+        depth = parent_node.depth + 1
+        new_node = self.Node(label, obj_info, depth)
+        parent_node.children.append(new_node)
+        self.label_map[label] = new_node
+        
+        # Update subtree sizes for this window's tree
+        window_tree.update_subtree_size()
+        
+        return label
+    
+    def _find_parent(self, current, new_node):
+        """Find the correct parent node for insertion based on bounding box comparison."""
+        if current is None:
+            return None
+        
+        # Check if new_node should be a child of any of current's children
+        for child in current.children:
+            comparison = new_node.compare_to(child)
+            if comparison == -1:  # New node is inside this child
+                return self._find_parent(child, new_node)
+            elif comparison is None:  # Duplicate
+                return None
+        
+        # No child contains new_node, so it should be a child of current
+        return current
+    
+    def _calculate_label_with_z_order(self, hwnd, parent_node):
+        """Calculate label based on window z-order and tree position.
+        
+        Objects from topmost windows (z-order 0) get highest labels.
+        Within each window, labels are sequential based on tree structure.
+        """
+        # Sort windows by z-order (lower z-order = more in front = higher label range)
+        sorted_windows = sorted(self.window_z_orders.items(), key=lambda x: x[1])
+        
+        # Calculate label ranges for each window
+        current_label = 1
+        window_label_starts = {}
+        
+        # Assign label ranges from back to front (higher z-order gets lower labels)
+        for window_hwnd, z_order in reversed(sorted_windows):
+            if window_hwnd not in self.window_trees:
+                continue
+            tree = self.window_trees[window_hwnd]
+            tree_size = tree.subtree_size
+            window_label_starts[window_hwnd] = current_label
+            current_label += tree_size + 1  # +1 for space to insert
+        
+        # Find label for current window
+        if hwnd not in window_label_starts:
+            # This shouldn't happen but handle it
+            return current_label
+        
+        base_label = window_label_starts[hwnd]
+        
+        # Find position within this window's tree (breadth-first order)
+        position_in_tree = 0
+        for node in self.BreadthFirstIterator(self.window_trees[hwnd], skip_root=True):
+            if node.depth < parent_node.depth + 1:
+                position_in_tree = max(position_in_tree, node.label if node.label >= base_label else 0)
+            elif node.depth == parent_node.depth + 1:
+                position_in_tree = max(position_in_tree, node.label if node.label >= base_label else 0)
+        
+        # If no nodes found at this depth, start right after base
+        if position_in_tree == 0:
+            return base_label
+        
+        return position_in_tree + 1
+    
+    def _get_window_for_label(self, label):
+        """Find which window a label belongs to."""
+        if label not in self.label_map:
+            return None
+        
+        node = self.label_map[label]
+        # Walk up to root to find window
+        current = node
+        while current.depth > 0:
+            if current.depth == 1:
+                # Parent is window root
+                return current.obj_info.get('hwnd')
+            # Try to find parent
+            for hwnd, tree in self.window_trees.items():
+                parent = self._find_parent_of_node(tree, current)
+                if parent:
+                    current = parent
+                    break
+            else:
+                break
+        
+        # Check if node itself contains hwnd
+        return node.obj_info.get('hwnd')
+    
+    def remove_label(self, label):
+        """Remove a label and its subtree from the appropriate window tree."""
+        if label not in self.label_map:
+            return False
+        
+        node = self.label_map[label]
+        
+        # Find which window this label belongs to
+        hwnd = None
+        for window_hwnd, tree in self.window_trees.items():
+            if self._node_in_tree(tree, node):
+                hwnd = window_hwnd
+                break
+        
+        if hwnd is None:
+            return False
+        
+        # Clear pixels for this node and all children
+        self._clear_node_pixels(node)
+        
+        # Remove node from parent's children list
+        parent_node = self._find_parent_of_node(self.window_trees[hwnd], node)
+        if parent_node:
+            parent_node.children.remove(node)
+        
+        # Update subtree sizes for this window's tree
+        self.window_trees[hwnd].update_subtree_size()
+        
+        return True
+    
+    def _node_in_tree(self, tree, target_node):
+        """Check if a node exists in a tree."""
+        if tree == target_node:
+            return True
+        for child in tree.children:
+            if self._node_in_tree(child, target_node):
+                return True
+        return False
+    
+    def _clear_node_pixels(self, node):
+        """Recursively clear pixels for a node and its children."""
+        # Clear this node's pixels
+        if node.label in self.label_map:
+            self.image[self.image == node.label] = 0
+            del self.label_map[node.label]
+        
+        # Clear children's pixels
+        for child in node.children:
+            self._clear_node_pixels(child)
+    
+    def _find_parent_of_node(self, current, target_node):
+        """Find the parent of a specific node."""
+        if current is None:
+            return None
+        
+        for child in current.children:
+            if child == target_node:
+                return current
+            parent = self._find_parent_of_node(child, target_node)
+            if parent:
+                return parent
+        
+        return None
+    
+    def fill_object_region(self, label, location, region):
+        """Fill object region with label, only overwriting pixels with lower depth (lower label values).
+        
+        Args:
+            label: The object label to write
+            location: Object location (screen coordinates)
+            region: Current capture region
+        """
+        # Convert to capture-layer-relative coordinates
+        obj_left = location.left - region.left
+        obj_top = location.top - region.top
+        obj_width = location.width
+        obj_height = location.height
+        
+        # Clamp to image bounds
+        img_height, img_width = self.image.shape[:2]
+        x1 = max(0, min(int(obj_left), img_width))
+        y1 = max(0, min(int(obj_top), img_height))
+        x2 = max(0, min(int(obj_left + obj_width), img_width))
+        y2 = max(0, min(int(obj_top + obj_height), img_height))
+        
+        # Fill object region with label (only on pixels with lower depth/label)
+        if x2 > x1 and y2 > y1:
+            region_slice = self.image[y1:y2, x1:x2]
+            # Only write where current label is lower (shallower depth) than new label
+            self.image[y1:y2, x1:x2] = np.where(region_slice < label, label, region_slice)
         
