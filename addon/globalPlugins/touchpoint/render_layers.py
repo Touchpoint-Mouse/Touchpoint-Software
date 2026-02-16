@@ -230,45 +230,18 @@ class ObjectTreeRenderer(Renderer):
                     obj_right = obj_left + location.width
                     obj_bottom = obj_top + location.height
                     
-                    # Check if object is too far outside capture bounds (with configurable threshold)
-                    # Calculate distance from object to capture region (0 if they overlap)
-                    if obj_right <= 0:
-                        # Object is to the left
-                        distance = -obj_right
-                    elif obj_left >= img_width:
-                        # Object is to the right
-                        distance = obj_left - img_width
-                    elif obj_bottom <= 0:
-                        # Object is above
-                        distance = -obj_bottom
-                    elif obj_top >= img_height:
-                        # Object is below
-                        distance = obj_top - img_height
-                    else:
-                        # Object overlaps with capture region
-                        distance = 0
-                    
-                    # Get distance threshold from config (default 200 pixels)
-                    distance_threshold = 200
-                    if self.plugin and hasattr(self.plugin, 'config'):
-                        distance_threshold = self.plugin.config.software.get('object_invalidation_distance', 200)
-                    
-                    # Remove object if it exceeds the distance threshold
-                    if distance > distance_threshold:
-                        self.object_tree_layer.remove_label(node.label)
-                        labels_removed += 1
-                        logMessage(f"[ObjectTreeRenderer] Removed out-of-bounds label {node.label} (distance={distance:.0f}px)")
-                        continue
-                    
                     # Clamp to image bounds
                     obj_left_clamped = max(0, obj_left)
                     obj_top_clamped = max(0, obj_top)
                     obj_right_clamped = min(img_width, obj_right)
                     obj_bottom_clamped = min(img_height, obj_bottom)
                     
-                    # If clamped region has zero size, object is completely outside but within threshold
-                    # Skip processing but don't remove (will be cleared by distance check on future frames)
+                    # If clamped region has zero size, object is completely outside bounds
+                    # Remove immediately to prevent orphaned pixels
                     if obj_right_clamped <= obj_left_clamped or obj_bottom_clamped <= obj_top_clamped:
+                        self.object_tree_layer.remove_label(node.label)
+                        labels_removed += 1
+                        logMessage(f"[ObjectTreeRenderer] Removed out-of-bounds label {node.label}")
                         continue
                     
                     # Extract the bounding box region from both object layer and diff_mask
@@ -847,8 +820,11 @@ class ObjectTreeLayer(RenderLayer):
         self.window_z_orders = {}
         # Label-to-node mapping for fast lookup
         self.label_map = {}
-        # Track next available label
-        self.next_label = 1
+        
+        # Fixed depth-based label allocation
+        self.max_depth = 5  # Maximum supported depth levels
+        self.labels_per_depth = 50  # Fixed allocation per depth
+        self.depth_counters = {}  # depth -> next available label in that depth's range
         
     def add_label(self, obj_info, parent_label=None):
         """Add a new object label to the tree with depth-based label assignment.
@@ -923,48 +899,104 @@ class ObjectTreeLayer(RenderLayer):
         # No child contains new_node, so it should be a child of current
         return current
     
-    def _calculate_label_with_z_order(self, hwnd, parent_node):
-        """Calculate label based on window z-order and tree position.
+    def _get_depth_range(self, depth):
+        """Get the fixed (start, end) label range for a depth level.
         
-        Objects from topmost windows (z-order 0) get highest labels.
-        Within each window, labels are sequential based on tree structure.
+        Args:
+            depth: Depth level (0 = window root, 1+ = UI elements)
+        
+        Returns:
+            Tuple of (start_label, end_label) or None if depth exceeds max
         """
-        # Sort windows by z-order (lower z-order = more in front = higher label range)
-        sorted_windows = sorted(self.window_z_orders.items(), key=lambda x: x[1])
+        if depth == 0:
+            return (0, 0)  # Window root always gets label 0
         
-        # Calculate label ranges for each window
-        current_label = 1
-        window_label_starts = {}
+        if depth > self.max_depth:
+            return None  # Depth exceeds maximum
         
-        # Assign label ranges from back to front (higher z-order gets lower labels)
-        for window_hwnd, z_order in reversed(sorted_windows):
-            if window_hwnd not in self.window_trees:
-                continue
-            tree = self.window_trees[window_hwnd]
-            tree_size = tree.subtree_size
-            window_label_starts[window_hwnd] = current_label
-            current_label += tree_size + 1  # +1 for space to insert
+        # Fixed ranges: depth 1 = 1-50, depth 2 = 51-100, depth 3 = 101-150, etc.
+        start_label = (depth - 1) * self.labels_per_depth + 1
+        end_label = depth * self.labels_per_depth
         
-        # Find label for current window
-        if hwnd not in window_label_starts:
-            # This shouldn't happen but handle it
-            return current_label
+        return (start_label, end_label)
+    
+    def _calculate_label_with_z_order(self, hwnd, parent_node):
+        """Allocate label from fixed depth range ensuring children have higher labels than parents.
         
-        base_label = window_label_starts[hwnd]
+        Each depth has a fixed range of labels:
+        - Depth 0 (window roots): 0
+        - Depth 1: 1-50
+        - Depth 2: 51-100
+        - Depth 3: 101-150
+        - Depth 4: 151-200
+        - Depth 5: 201-250
         
-        # Find position within this window's tree (breadth-first order)
-        position_in_tree = 0
-        for node in self.BreadthFirstIterator(self.window_trees[hwnd], skip_root=True):
-            if node.depth < parent_node.depth + 1:
-                position_in_tree = max(position_in_tree, node.label if node.label >= base_label else 0)
-            elif node.depth == parent_node.depth + 1:
-                position_in_tree = max(position_in_tree, node.label if node.label >= base_label else 0)
+        Returns:
+            int: Label for the new node, or 0 if allocation failed
+        """
+        depth = parent_node.depth + 1
         
-        # If no nodes found at this depth, start right after base
-        if position_in_tree == 0:
-            return base_label
+        # Get fixed range for this depth
+        depth_range = self._get_depth_range(depth)
+        if depth_range is None:
+            logMessage(f"[ERROR] Depth {depth} exceeds max_depth {self.max_depth}")
+            return 0
         
-        return position_in_tree + 1
+        start_label, end_label = depth_range
+        
+        # Special case for window root
+        if depth == 0:
+            return 0
+        
+        # Initialize counter for this depth if needed
+        if depth not in self.depth_counters:
+            self.depth_counters[depth] = start_label
+        
+        # Get next available label from this depth's range
+        label = self.depth_counters[depth]
+        
+        # Check if we've exhausted this depth's range
+        if label > end_label:
+            logMessage(f"[ERROR] Depth {depth} exhausted its label range [{start_label}, {end_label}]")
+            # Reset to start (will cause collisions but prevents crash)
+            self.depth_counters[depth] = start_label
+            label = start_label
+        
+        # Increment counter for next allocation
+        self.depth_counters[depth] += 1
+        
+        return label
+    
+    def get_label_allocation_stats(self):
+        """Get statistics about label allocation for debugging/monitoring.
+        
+        Returns:
+            dict: Statistics including fixed depth ranges and current usage
+        """
+        stats = {
+            'max_depth': self.max_depth,
+            'labels_per_depth': self.labels_per_depth,
+            'depths': {}
+        }
+        
+        for depth in range(1, self.max_depth + 1):
+            depth_range = self._get_depth_range(depth)
+            if depth_range:
+                start, end = depth_range
+                current_counter = self.depth_counters.get(depth, start)
+                used_in_range = current_counter - start
+                available = end - current_counter + 1
+                count = sum(1 for n in self.label_map.values() if n.depth == depth)
+                
+                stats['depths'][depth] = {
+                    'fixed_range': (start, end),
+                    'next_label': current_counter,
+                    'allocated': used_in_range,
+                    'available': available,
+                    'active_objects': count
+                }
+        
+        return stats
     
     def _get_window_for_label(self, label):
         """Find which window a label belongs to."""
