@@ -15,7 +15,7 @@ import time
 import sys
 import os
 import ctypes
-from .utils import logMessage, logUIElement
+from .utils import Rect, logMessage, logUIElement
 from .render_pipeline import RenderPipeline
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
@@ -137,7 +137,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                 self.mouse_position = current_pos
             
             # Calculate new region centered on current mouse position
-            new_region = Region(
+            new_region = Rect(
                 left=current_pos[0] - self.capture_region_width // 2,
                 top=current_pos[1] - self.capture_region_height // 2,
                 width=self.capture_region_width,
