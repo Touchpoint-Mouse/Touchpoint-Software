@@ -3,6 +3,127 @@ import controlTypes
 import winUser
 import ctypes
 
+class Rect:
+    """Simple rectangle class to represent object locations.
+    """
+    def __init__(self, left, top, right, bottom, width=None, height=None):
+        """Generates rectangle coordinates from either left/top/right/bottom (default) or left/top/width/height."""
+        self.left = left
+        self.top = top
+        self.right = right if right is not None else left + width if width is not None else left
+        self.bottom = bottom if bottom is not None else top + height if height is not None else top
+        self.width = self.right - self.left
+        self.height = self.bottom - self.top
+        
+    def copy(self):
+        """Create a copy of this Rect."""
+        return Rect(self.left, self.top, self.right, self.bottom)
+    
+    def area(self):
+        """Calculate the area of the rectangle."""
+        return max(0, self.width) * max(0, self.height)
+    
+    def perimeter(self):
+        """Calculate the perimeter of the rectangle."""
+        return 2 * (max(0, self.width) + max(0, self.height))
+        
+    def intersection(self, other):
+        """Calculate the intersection of this rectangle with another.
+        
+        Args:
+            other (Rect): Another rectangle to intersect with.
+        
+        Returns:
+            Rect: A new Rect representing the intersection area, or None if no intersection.
+        """
+        left = max(self.left, other.left)
+        top = max(self.top, other.top)
+        right = min(self.right, other.right)
+        bottom = min(self.bottom, other.bottom)
+        
+        if left < right and top < bottom:
+            return Rect(left, top, right, bottom)
+        return None
+    
+    def union(self, other):
+        """Calculate the union of this rectangle with another.
+        
+        Args:
+            other (Rect): Another rectangle to union with.
+        
+        Returns:
+            Rect: A new Rect representing the union area.
+        """
+        left = min(self.left, other.left)
+        top = min(self.top, other.top)
+        right = max(self.right, other.right)
+        bottom = max(self.bottom, other.bottom)
+        
+        return Rect(left, top, right, bottom)
+    
+    def iou(self, other):
+        """Calculate the Intersection over Union (IoU) with another rectangle.
+        
+        Args:
+            other (Rect): Another rectangle to compare with.
+        
+        Returns:
+            float: IoU value between 0 and 1, or 0 if no intersection.
+        """
+        intersection = self.intersection(other)
+        if not intersection:
+            return 0.0
+        
+        intersection_area = intersection.area()
+        union_area = self.area() + other.area() - intersection_area
+        
+        return intersection_area / union_area if union_area > 0 else 0.0
+    
+    def contains(self, other):
+        """Check if this rectangle completely contains another.
+        
+        Args:
+            other (Rect): Another rectangle to check.
+        
+        Returns:
+            bool: True if this rectangle contains the other, False otherwise.
+        """
+        return (self.left <= other.left and
+                self.top <= other.top and
+                self.right >= other.right and
+                self.bottom >= other.bottom)
+        
+    def intersects(self, other):
+        """Check if this rectangle intersects with another.
+        
+        Args:
+            other (Rect): Another rectangle to check.
+        
+        Returns:
+            bool: True if the rectangles intersect, False otherwise.
+        """
+        return not (self.right <= other.left or
+                    self.left >= other.right or
+                    self.bottom <= other.top or
+                    self.top >= other.bottom)
+    
+    def inside(self, other):
+        """Check if this rectangle is completely inside another.
+        
+        Args:
+            other (Rect): Another rectangle to check.
+        
+        Returns:
+            bool: True if this rectangle is inside the other, False otherwise.
+        """
+        return (self.left >= other.left and
+                self.top >= other.top and
+                self.right <= other.right and
+                self.bottom <= other.bottom)
+        
+    def __repr__(self):
+        return f"Rect({self.left}, {self.top}, {self.right}, {self.bottom})"
+
 def logMessage(message):
         """Log a message to the NVDA log.
         """
@@ -83,7 +204,7 @@ def get_window_z_order(hwnd):
             current_hwnd = prev_hwnd
             
             # Prevent infinite loop (safety check)
-            if z_order > 1000:
+            if z_order > 100:
                 return -1
         
         return z_order
@@ -159,7 +280,7 @@ def get_window_rect(hwnd):
         hwnd: Window handle (HWND)
     
     Returns:
-        tuple: (left, top, right, bottom) or None if error
+        Rect object
     """
     try:
         if not hwnd:
@@ -174,7 +295,7 @@ def get_window_rect(hwnd):
         
         rect = RECT()
         if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            return (rect.left, rect.top, rect.right, rect.bottom)
+            return Rect(rect.left, rect.top, rect.right, rect.bottom)
         return None
     except Exception as e:
         logMessage(f"Error getting window rect: {e}")
@@ -196,16 +317,12 @@ def is_window_occluded(hwnd, obj_location=None):
         
         # Get the region to check (either object location or full window)
         if obj_location:
-            check_left = obj_location.left
-            check_top = obj_location.top
-            check_right = obj_location.left + obj_location.width
-            check_bottom = obj_location.top + obj_location.height
+            check_rect = obj_location.copy()
         else:
-            rect = get_window_rect(hwnd)
-            if not rect:
+            check_rect = get_window_rect(hwnd)
+            if not check_rect:
                 return False
-            check_left, check_top, check_right, check_bottom = rect
-        
+            
         # Get z-order of this window
         z_order = get_window_z_order(hwnd)
         if z_order < 0:
@@ -227,13 +344,8 @@ def is_window_occluded(hwnd, obj_location=None):
                 current_hwnd = prev_hwnd
                 continue
             
-            front_left, front_top, front_right, front_bottom = front_rect
-            
             # Check if this window in front completely covers our region
-            if (front_left <= check_left and 
-                front_top <= check_top and 
-                front_right >= check_right and 
-                front_bottom >= check_bottom):
+            if (front_rect.contains(check_rect)):
                 # This window completely covers our region
                 # Check if it's visible (not minimized)
                 try:
