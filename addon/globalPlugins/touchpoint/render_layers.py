@@ -1,13 +1,10 @@
 import math
 import threading
 from .dependencies import np, cv2
-from .utils import logMessage
+from .utils import Rect, logMessage
 import time
 from collections import namedtuple
 import NVDAObjects
-
-# Region definition for consistent region management
-Region = namedtuple('Region', ['left', 'top', 'width', 'height'])
 
 class Renderer:
     """Base class for layer renderers."""
@@ -140,7 +137,7 @@ class CaptureRenderer(Renderer):
                 captured_image = frame[:, :, :3]
                 
                 # Store the captured region (not the desired region)
-                captured_region = Region(
+                captured_region = Rect(
                     left=monitor["left"],
                     top=monitor["top"],
                     width=monitor["width"],
@@ -524,8 +521,8 @@ class RenderLayer:
         self.prev_image = np.array([], dtype=dtype)
         
         # Region tracking for relative bounds
-        self.current_region = Region(0, 0, 0, 0)  # Current absolute screen region
-        self.prev_region = Region(0, 0, 0, 0)  # Previous absolute screen region
+        self.current_region = Rect(0, 0, 0, 0)  # Current absolute screen region
+        self.prev_region = Rect(0, 0, 0, 0)  # Previous absolute screen region
         
     def get_image(self):
         """Get the current rendered image with thread safety."""
@@ -639,7 +636,7 @@ class RenderLayer:
         If constant_size is set to (width, height), maintains those fixed dimensions.
         
         Args:
-            new_region: Region namedtuple with (left, top, width, height) in screen coordinates
+            new_region: Rect
         """
         # Store old state
         old_image = self.image.copy() if self.image.size > 0 else None
@@ -1095,20 +1092,16 @@ class ObjectTreeLayer(RenderLayer):
             region: Current capture region
         """
         # Convert to capture-layer-relative coordinates
-        obj_left = location.left - region.left
-        obj_top = location.top - region.top
-        obj_width = location.width
-        obj_height = location.height
+        obj = Rect(location.left - region.left, location.top - region.top, location.width, location.height)
         
         # Clamp to image bounds
         img_height, img_width = self.image.shape[:2]
-        x1 = max(0, min(int(obj_left), img_width))
-        y1 = max(0, min(int(obj_top), img_height))
-        x2 = max(0, min(int(obj_left + obj_width), img_width))
-        y2 = max(0, min(int(obj_top + obj_height), img_height))
-        
+        image_rect = Rect(0, 0, img_width, img_height)
+        obj_clamped = obj.intersection(image_rect)
+                
         # Fill object region with label (only on pixels with lower depth/label)
-        if x2 > x1 and y2 > y1:
+        if obj_clamped.width > 0 and obj_clamped.height > 0:
+            x1, y1, x2, y2 = obj_clamped.left, obj_clamped.top, obj_clamped.right, obj_clamped.bottom
             region_slice = self.image[y1:y2, x1:x2]
             # Only write where current label is lower (shallower depth) than new label
             self.image[y1:y2, x1:x2] = np.where(region_slice < label, label, region_slice)

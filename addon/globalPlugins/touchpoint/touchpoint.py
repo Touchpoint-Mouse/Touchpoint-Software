@@ -20,7 +20,6 @@ from .render_pipeline import RenderPipeline
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
 from .emulator_gui import TouchpointEmulatorGUI
-from .render_layers import Region
 from .config import TouchpointConfig
 
 
