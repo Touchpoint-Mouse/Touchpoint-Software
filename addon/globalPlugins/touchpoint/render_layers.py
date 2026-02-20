@@ -1004,15 +1004,32 @@ class ObjectLayer(RenderLayer):
         return stats
     
     def remove_label(self, label):
-        """Remove a label"""
+        """Remove a label and recycle its position in the depth range."""
         if label not in self.label_map:
             return False
+        
+        # Get depth level and hwnd before removing
+        label_depth = self.label_map[label]['depth']
+        label_hwnd = self.label_map[label]['hwnd']
         
         # Clear pixels for this node
         self.image[self.image == label] = 0
         
         # Remove from label map
         del self.label_map[label]
+        
+        # If this was a window label (depth 0), remove from window tracking
+        if label_depth == 0 and label_hwnd in self.window_labels:
+            if self.window_labels[label_hwnd] == label:
+                del self.window_labels[label_hwnd]
+                logMessage(f"[ObjectLayer] Removed window label {label} for hwnd {label_hwnd}")
+        
+        # Recycle the label position by resetting depth counter if this label is earlier
+        if label_depth in self.depth_counters:
+            # If this freed label is less than the current counter, reset to reuse it
+            if label < self.depth_counters[label_depth]:
+                self.depth_counters[label_depth] = label
+                logMessage(f"[ObjectLayer] Recycled label {label} at depth {label_depth}, reset counter")
         
         return True
     
