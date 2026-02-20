@@ -56,7 +56,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.capture_region_height = capture_height
         
         # Initialize all layers with starting region bounds
-        initial_region = Region(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
+        initial_region = Rect(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
         self.render_pipeline.update_layer_regions(initial_region)
         
         # Render thread

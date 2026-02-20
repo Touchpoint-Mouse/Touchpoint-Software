@@ -2,11 +2,12 @@ import logHandler
 import controlTypes
 import winUser
 import ctypes
+from .dependencies import np
 
 class Rect:
     """Simple rectangle class to represent object locations.
     """
-    def __init__(self, left, top, right, bottom, width=None, height=None):
+    def __init__(self, left, top, right=None, bottom=None, width=None, height=None):
         """Generates rectangle coordinates from either left/top/right/bottom (default) or left/top/width/height."""
         self.left = left
         self.top = top
@@ -120,6 +121,45 @@ class Rect:
                 self.top >= other.top and
                 self.right <= other.right and
                 self.bottom <= other.bottom)
+    
+    def top_left(self):
+        """Get the top-left corner coordinates."""
+        return (self.left, self.top)
+    
+    def bottom_right(self):
+        """Get the bottom-right corner coordinates."""
+        return (self.right, self.bottom)
+    
+    def shape(self):
+        """Get the shape of the rectangle as (width, height)."""
+        return (self.width, self.height)
+        
+    def global_to_local(self, global_point):
+        """Get rectangle coordinates relative to a global point (e.g., screen origin)."""
+        return Rect(
+            self.left - global_point[0],
+            self.top - global_point[1],
+            self.right - global_point[0],
+            self.bottom - global_point[1]
+        )
+        
+    def local_to_global(self, local_point):
+        """Get rectangle coordinates relative to a local point (e.g., window origin)."""
+        return Rect(
+            self.left + local_point[0],
+            self.top + local_point[1],
+            self.right + local_point[0],
+            self.bottom + local_point[1]
+        )
+        
+    def pad(self, padding):
+        """Expand the rectangle by a certain padding on all sides."""
+        return Rect(
+            self.left - padding,
+            self.top - padding,
+            self.right + padding,
+            self.bottom + padding
+        )
         
     def __repr__(self):
         return f"Rect({self.left}, {self.top}, {self.right}, {self.bottom})"
@@ -360,3 +400,36 @@ def is_window_occluded(hwnd, obj_location=None):
     except Exception as e:
         logMessage(f"Error checking window occlusion: {e}")
         return False
+    
+def get_rect_mask(rect, image_shape):
+    """Generate a boolean mask for a given rectangle within an image shape.
+    
+    Args:
+        rect: Rect object defining the area to mask
+        image_shape: Tuple (height, width) of the image
+    Returns:
+        np.ndarray: Boolean mask with True for pixels on the inside border of the rectangle and False elsewhere
+    """
+    mask = np.zeros(image_shape, dtype=bool)
+    
+    # Ensure rectangle is within image bounds
+    clamped = rect.intersection(Rect(0, 0, image_shape[1], image_shape[0]))
+    
+    # If clamped rect is empty, return the mask (all False)
+    if not clamped:
+        return mask
+    
+    left = clamped.left
+    right = clamped.right
+    top = clamped.top
+    bottom = clamped.bottom
+    
+    # Set the border pixels to True
+    if left < right and top < bottom:
+        mask[top:bottom, left] = True  # Left border
+        mask[top:bottom, right-1] = True  # Right border
+        mask[top, left:right] = True  # Top border
+        mask[bottom-1, left:right] = True  # Bottom border
+    
+    return mask
+    
