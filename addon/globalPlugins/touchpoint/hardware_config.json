@@ -1,0 +1,20 @@
+{
+    "headers": {
+        "ping": 255,
+        "elevation": 16,
+        "elevation_speed": 17,
+        "vibration": 32
+    },
+    "serial": {
+        "port": "COM6",
+        "baud_rate": 460800
+    },
+    "display": {
+        "aspect_ratio": 0.625,
+        "resolution": 36.0
+    },
+    "elevation": {
+        "max_elevation": 180,
+        "max_elevation_speed": 180
+    }
+}

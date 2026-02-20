@@ -32,14 +32,20 @@ class TouchpointEmulatorGUI:
         
         # State variables
         self.hardware_connected = False
-        self.current_elevation = 0.0  # 0.0-1.0 range
-        self.target_elevation = 0.0  # 0.0-1.0 range
-        self.max_elevation_speed = 1.0  # units per second (1 unit = full range)
+        self.current_elevation = 0.0  # Current elevation value (0 to max_elevation)
+        self.target_elevation = 0.0  # Target elevation value (0 to max_elevation)
+        self.max_elevation = 180  # Maximum elevation value (default 180)
+        self.max_elevation_speed = 255  # units per second
         self.last_update_time = time.time()
         
-        # Depth map data
-        self.current_depth_map = None
-        self.depth_map_lock = threading.Lock()
+        # Layer image storage - keyed by layer ID
+        self.layer_images = {}  # {layer_id: numpy_array}
+        self.layer_images_lock = threading.Lock()
+        
+        # Layer metadata
+        self.layer_ids = []  # List of layer IDs in order
+        self.aspect_ratio = 1.0  # Width/height ratio for display area
+        self.current_layer_id = None  # Currently selected layer
         
         # Update timer
         self.timer = None
@@ -54,6 +60,27 @@ class TouchpointEmulatorGUI:
             colormap_cv2: OpenCV colormap constant (e.g., cv2.COLORMAP_VIRIDIS, cv2.COLORMAP_JET)
         """
         self.colormap_cv2 = colormap_cv2
+    
+    def initialize_layers(self, layer_ids, aspect_ratio):
+        """Initialize the emulator with layer IDs and aspect ratio.
+        
+        Args:
+            layer_ids: List of layer ID strings (e.g., ['capture', 'depth', 'semantic'])
+            aspect_ratio: Width/height ratio for the display area
+        """
+        self.layer_ids = layer_ids
+        self.aspect_ratio = aspect_ratio
+        if layer_ids and not self.current_layer_id:
+            self.current_layer_id = layer_ids[0]  # Default to first layer
+        logMessage(f"Emulator initialized with layers: {layer_ids}, aspect ratio: {aspect_ratio:.2f}")
+        
+        # If window is already open, update the layer tabs
+        if self.is_open and self.frame:
+            wx.CallAfter(self._populate_layer_tabs)
+    
+    def is_window_open(self):
+        """Check if the emulator window is currently open."""
+        return self.is_open
     
     def open_window(self, hardware_status):
         """Open the emulator window (called from NVDA keybind)."""
@@ -78,6 +105,10 @@ class TouchpointEmulatorGUI:
             
             # Build GUI
             self._build_gui()
+            
+            # Populate layer tabs if layers have been initialized
+            if self.layer_ids:
+                self._populate_layer_tabs()
             
             # Update connection status label based on current hardware state
             self._update_connection_status()
@@ -146,23 +177,36 @@ class TouchpointEmulatorGUI:
         
         elevation_sizer.Add(elevation_row, 0, wx.ALL, 0)
         
-        self.elevation_value_label = wx.StaticText(panel, label="0.0%")
+        self.elevation_value_label = wx.StaticText(panel, label="0.0 / 180")
         value_font = wx.Font(14, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
         self.elevation_value_label.SetFont(value_font)
         elevation_sizer.Add(self.elevation_value_label, 0, wx.ALL | wx.CENTER, 5)
         
         canvas_sizer.Add(elevation_sizer, 1, wx.ALL | wx.EXPAND, 5)
         
-        # Depth Map Display Section (right side)
-        depth_box = wx.StaticBox(panel, label="Depth Map (Cursor Region)")
-        depth_sizer = wx.StaticBoxSizer(depth_box, wx.VERTICAL)
+        # Layer Display Section with tabs (right side)
+        layer_box = wx.StaticBox(panel, label="Layer View (Cursor Region)")
+        layer_sizer = wx.StaticBoxSizer(layer_box, wx.VERTICAL)
         
-        self.depth_map_panel = wx.Panel(panel, size=(280, 200))
-        self.depth_map_panel.SetBackgroundColour(wx.WHITE)
-        self.depth_map_panel.Bind(wx.EVT_PAINT, self._on_paint_depth_map)
-        depth_sizer.Add(self.depth_map_panel, 0, wx.ALL, 5)
+        # Create notebook for layer tabs
+        self.layer_notebook = wx.Notebook(panel)
         
-        canvas_sizer.Add(depth_sizer, 1, wx.ALL | wx.EXPAND, 5)
+        # Add tabs for each layer (will be populated dynamically)
+        # Start with a placeholder panel
+        self.layer_panels = {}  # {layer_id: panel}
+        placeholder_panel = wx.Panel(self.layer_notebook)
+        placeholder_sizer = wx.BoxSizer(wx.VERTICAL)
+        placeholder_label = wx.StaticText(placeholder_panel, label="No layers initialized")
+        placeholder_sizer.Add(placeholder_label, 1, wx.ALL | wx.CENTER, 10)
+        placeholder_panel.SetSizer(placeholder_sizer)
+        self.layer_notebook.AddPage(placeholder_panel, "No Data")
+        
+        layer_sizer.Add(self.layer_notebook, 1, wx.ALL | wx.EXPAND, 5)
+        
+        # Bind tab change event
+        self.layer_notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_layer_tab_changed)
+        
+        canvas_sizer.Add(layer_sizer, 1, wx.ALL | wx.EXPAND, 5)
         
         main_sizer.Add(canvas_sizer, 0, wx.ALL | wx.EXPAND, 5)
         
@@ -196,7 +240,7 @@ class TouchpointEmulatorGUI:
         """Set target elevation.
         
         Args:
-            elevation: Target elevation value (0.0-1.0)
+            elevation: Target elevation value (0 to max_elevation)
         """
         self.target_elevation = elevation
     
@@ -207,6 +251,14 @@ class TouchpointEmulatorGUI:
             speed: Maximum speed in units per second
         """
         self.max_elevation_speed = speed
+    
+    def set_max_elevation(self, max_elevation):
+        """Set maximum elevation value.
+        
+        Args:
+            max_elevation: Maximum elevation value
+        """
+        self.max_elevation = max_elevation
     
     def set_vibration(self, amplitude, frequency, duration):
         """Set vibration parameters.
@@ -220,14 +272,19 @@ class TouchpointEmulatorGUI:
         if self.is_open and self.frame:
             wx.CallAfter(self._add_vibration_log, amplitude, frequency, duration)
     
-    def update_depth_map(self, depth_map):
-        """Update the depth map display.
+    def update_layer_image(self, layer_id, image):
+        """Update a layer's image data.
         
         Args:
-            depth_map: Numpy array representing depth map around cursor
+            layer_id: String identifier for the layer (e.g., 'capture', 'depth')
+            image: Numpy array representing the layer image
         """
-        with self.depth_map_lock:
-            self.current_depth_map = depth_map.copy() if depth_map is not None else None
+        with self.layer_images_lock:
+            if image is not None and image.size > 0:
+                self.layer_images[layer_id] = image.copy()
+            elif layer_id in self.layer_images:
+                # Remove empty images
+                del self.layer_images[layer_id]
     
     def _add_vibration_log(self, amplitude, frequency, duration):
         """Add vibration event to log."""
@@ -266,6 +323,47 @@ class TouchpointEmulatorGUI:
             self.hardware_status_label.SetLabel("Disconnected")
             self.hardware_status_label.SetForegroundColour(wx.RED)
     
+    def _populate_layer_tabs(self):
+        """Populate the notebook with tabs for each layer."""
+        if not self.layer_ids or not self.frame:
+            return
+            
+        try:
+            # Remove all existing pages
+            while self.layer_notebook.GetPageCount() > 0:
+                self.layer_notebook.DeletePage(0)
+            
+            self.layer_panels.clear()
+            
+            # Add a tab for each layer
+            for layer_id in self.layer_ids:
+                panel = wx.Panel(self.layer_notebook, size=(280, 200))
+                panel.SetBackgroundColour(wx.WHITE)
+                panel.Bind(wx.EVT_PAINT, lambda evt, lid=layer_id: self._on_paint_layer(evt, lid))
+                
+                self.layer_panels[layer_id] = panel
+                self.layer_notebook.AddPage(panel, layer_id.capitalize())
+            
+            # Select the first tab
+            if self.current_layer_id and self.current_layer_id in self.layer_ids:
+                idx = self.layer_ids.index(self.current_layer_id)
+                self.layer_notebook.SetSelection(idx)
+            
+            logMessage(f"Populated {len(self.layer_ids)} layer tabs")
+        except Exception as e:
+            logMessage(f"[ERROR] Failed to populate layer tabs: {e}")
+    
+    def _on_layer_tab_changed(self, event):
+        """Handle layer tab selection change."""
+        try:
+            selection = self.layer_notebook.GetSelection()
+            if 0 <= selection < len(self.layer_ids):
+                self.current_layer_id = self.layer_ids[selection]
+                logMessage(f"Switched to layer: {self.current_layer_id}")
+        except Exception as e:
+            logMessage(f"[ERROR] Failed to handle tab change: {e}")
+        event.Skip()
+    
     def _update_display(self):
         """Periodic update of the display elements."""
         if not self.is_open or not self.frame:
@@ -277,7 +375,7 @@ class TouchpointEmulatorGUI:
         
         # Smoothly animate elevation towards target based on speed
         if abs(self.target_elevation - self.current_elevation) > 0.01:
-            # Calculate max change for this frame (speed is in units/second, where 1 unit = full range)
+            # Calculate max change for this frame (speed is in units/second)
             max_change = self.max_elevation_speed * delta_time
             
             # Move towards target
@@ -287,13 +385,16 @@ class TouchpointEmulatorGUI:
             else:
                 self.current_elevation += max_change if diff > 0 else -max_change
         
-        # Update displays
-        self.elevation_value_label.SetLabel(f"{self.current_elevation*100:.1f}%")
+        # Update displays - show raw elevation value and max
+        self.elevation_value_label.SetLabel(f"{self.current_elevation:.1f} / {self.max_elevation}")
         
         # Trigger repaints
         self.elevation_panel.Refresh()
         self.colormap_scale_panel.Refresh()
-        self.depth_map_panel.Refresh()
+        
+        # Refresh current layer panel if it exists
+        if self.current_layer_id and self.current_layer_id in self.layer_panels:
+            self.layer_panels[self.current_layer_id].Refresh()
     
     def _on_paint_elevation(self, event):
         """Draw the elevation water level indicator using OpenCV."""
@@ -302,7 +403,9 @@ class TouchpointEmulatorGUI:
         
         try:
             # Calculate how many pixels the elevation should fill (from bottom)
-            filled_height = int(self.current_elevation * height)
+            # Normalize elevation to 0-1 range for display
+            elevation_normalized = self.current_elevation / self.max_elevation if self.max_elevation > 0 else 0
+            filled_height = int(elevation_normalized * height)
             
             # Create full gradient for entire height (255 at top to 0 at bottom)
             # This way, as elevation rises, we reveal brighter colors
@@ -359,50 +462,83 @@ class TouchpointEmulatorGUI:
         except Exception as e:
             logMessage(f"[ERROR] Failed to draw colormap scale: {e}")
     
-    def _on_paint_depth_map(self, event):
-        """Draw the depth map visualization using OpenCV."""
-        dc = wx.PaintDC(self.depth_map_panel)
-        width, height = self.depth_map_panel.GetSize()
+    def _on_paint_layer(self, event, layer_id):
+        """Draw the layer visualization using OpenCV.
         
-        # Get depth map data
-        with self.depth_map_lock:
-            depth_map = self.current_depth_map
+        Args:
+            event: Paint event
+            layer_id: ID of the layer to paint
+        """
+        # Get the panel for this layer
+        if layer_id not in self.layer_panels:
+            return
+            
+        panel = self.layer_panels[layer_id]
+        dc = wx.PaintDC(panel)
+        width, height = panel.GetSize()
         
-        if depth_map is None or depth_map.size == 0:
+        # Get layer image data
+        with self.layer_images_lock:
+            layer_image = self.layer_images.get(layer_id)
+        
+        if layer_image is None or layer_image.size == 0:
             # No data, show message
             dc.SetBackground(wx.Brush(wx.WHITE))
             dc.Clear()
             dc.SetTextForeground(wx.Colour(128, 128, 128))
             font = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL)
             dc.SetFont(font)
-            text_width, text_height = dc.GetTextExtent("No depth map data")
-            dc.DrawText("No depth map data", (width - text_width) // 2, (height - text_height) // 2)
+            text_width, text_height = dc.GetTextExtent(f"No data for {layer_id}")
+            dc.DrawText(f"No data for {layer_id}", (width - text_width) // 2, (height - text_height) // 2)
             return
         
         try:
-            # Convert depth map (0-1 float) to grayscale (0-255 uint8)
-            depth_gray = (depth_map * 255).astype(np.uint8)
+            # Determine if image is grayscale or color
+            if len(layer_image.shape) == 2:
+                # Grayscale image - apply colormap
+                layer_colored = cv2.applyColorMap(layer_image, self.colormap_cv2)
+            elif len(layer_image.shape) == 3 and layer_image.shape[2] == 1:
+                # Single channel as 3D array - apply colormap
+                layer_colored = cv2.applyColorMap(layer_image[:, :, 0], self.colormap_cv2)
+            else:
+                # Already color (BGR format from capture)
+                layer_colored = layer_image
             
-            # Apply colormap
-            depth_colored = cv2.applyColorMap(depth_gray, self.colormap_cv2)
-            
-            # Resize to fit panel
-            depth_resized = cv2.resize(depth_colored, (width, height), interpolation=cv2.INTER_NEAREST)
-            
-            # Draw cursor crosshair in center (smaller and thinner)
-            cy, cx = height // 2, width // 2
-            crosshair_length = 10  # pixels from center
-            cv2.line(depth_resized, (cx - crosshair_length, cy), (cx + crosshair_length, cy), (0, 0, 255), 1)
-            cv2.line(depth_resized, (cx, cy - crosshair_length), (cx, cy + crosshair_length), (0, 0, 255), 1)
-            
-            # Convert BGR to RGB for wx
-            depth_rgb = cv2.cvtColor(depth_resized, cv2.COLOR_BGR2RGB)
-            
-            # Convert to wx.Bitmap
-            image = wx.Image(width, height)
-            image.SetData(depth_rgb.tobytes())
-            bitmap = wx.Bitmap(image)
-            dc.DrawBitmap(bitmap, 0, 0)
+            # Resize to fit panel while maintaining aspect ratio
+            img_height, img_width = layer_colored.shape[:2]
+            if img_width > 0 and img_height > 0:
+                # Calculate scaling to fit in panel
+                scale_w = width / img_width
+                scale_h = height / img_height
+                scale = min(scale_w, scale_h)
+                
+                new_width = int(img_width * scale)
+                new_height = int(img_height * scale)
+                
+                layer_resized = cv2.resize(layer_colored, (new_width, new_height), interpolation=cv2.INTER_NEAREST)
+                
+                # Draw cursor crosshair in center (smaller and thinner)
+                cy, cx = new_height // 2, new_width // 2
+                crosshair_length = 10  # pixels from center
+                cv2.line(layer_resized, (cx - crosshair_length, cy), (cx + crosshair_length, cy), (0, 0, 255), 1)
+                cv2.line(layer_resized, (cx, cy - crosshair_length), (cx, cy + crosshair_length), (0, 0, 255), 1)
+                
+                # Convert BGR to RGB for wx
+                layer_rgb = cv2.cvtColor(layer_resized, cv2.COLOR_BGR2RGB)
+                
+                # Clear background
+                dc.SetBackground(wx.Brush(wx.WHITE))
+                dc.Clear()
+                
+                # Center the image in panel
+                x_offset = (width - new_width) // 2
+                y_offset = (height - new_height) // 2
+                
+                # Convert to wx.Bitmap
+                image = wx.Image(new_width, new_height)
+                image.SetData(layer_rgb.tobytes())
+                bitmap = wx.Bitmap(image)
+                dc.DrawBitmap(bitmap, x_offset, y_offset)
             
         except Exception as e:
             dc.SetBackground(wx.Brush(wx.WHITE))
@@ -413,7 +549,7 @@ class TouchpointEmulatorGUI:
             error_text = f"Error: {str(e)}"
             text_width, text_height = dc.GetTextExtent(error_text)
             dc.DrawText(error_text, (width - text_width) // 2, (height - text_height) // 2)
-            logMessage(f"[ERROR] Failed to draw depth map: {e}")
+            logMessage(f"[ERROR] Failed to draw layer {layer_id}: {e}")
     
     def _on_close(self, event):
         """Handle window close event."""
