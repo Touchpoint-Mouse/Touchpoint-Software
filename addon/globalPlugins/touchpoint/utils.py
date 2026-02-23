@@ -228,8 +228,48 @@ def logUIElement(obj, eventName):
     except Exception as e:
         logMessage(f"Error logging UI element: {str(e)}")
 
+def is_desktop_or_shell_window(hwnd):
+    """Check if a window is a desktop or shell window.
+    
+    Desktop/shell windows should not occlude other windows.
+    
+    Args:
+        hwnd: Window handle
+        
+    Returns:
+        bool: True if desktop/shell window
+    """
+    try:
+        if not hwnd:
+            return False
+        
+        # Check window class name
+        import ctypes
+        class_name = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, class_name, 256)
+        class_name_str = class_name.value
+        
+        # Known desktop/shell window classes
+        desktop_classes = ['Progman', 'WorkerW', 'Shell_TrayWnd', 'DV2ControlHost']
+        if class_name_str in desktop_classes:
+            return True
+        
+        # Also check by dimensions (fallback)
+        window_rect = get_window_rect(hwnd)
+        if window_rect and window_rect.left == 0 and window_rect.top == 0 and window_rect.width > 2000 and window_rect.height > 1000:
+            return True
+        
+        return False
+    except:
+        return False
+
+
 def get_window_z_order(hwnd):
     """Get the z-order position of a window (0 = topmost).
+    
+    NOTE: This counts ALL windows above the given window in the z-order stack,
+    not just tracked windows. For relative comparison between specific windows,
+    use get_relative_z_orders() instead.
     
     Args:
         hwnd: Window handle (HWND)
@@ -256,47 +296,104 @@ def get_window_z_order(hwnd):
             z_order += 1
             current_hwnd = prev_hwnd
             
-            # Prevent infinite loop (safety check)
-            if z_order > 100:
+            # Prevent infinite loop (safety check) - increased limit
+            if z_order > 500:
+                logMessage(f"[get_window_z_order] Exceeded 500 windows for hwnd {hwnd}, stopping")
                 return -1
         
         return z_order
     except Exception as e:
-        logMessage(f"Error getting window z-order: {e}")
+        logMessage(f"[get_window_z_order] Error for hwnd {hwnd}: {e}")
         return -1
 
-def compare_window_z_order(hwnd1, hwnd2):
-    """Compare z-order of two windows.
+def get_relative_z_orders(hwnds):
+    """Get relative z-orders for a set of tracked windows.
+    
+    Builds a z-order map by traversing the window stack and assigning
+    positions only to windows in the tracked set. This gives proper
+    relative ordering between the windows we care about.
     
     Args:
-        hwnd1: First window handle
-        hwnd2: Second window handle
+        hwnds: Iterable of window handles to get relative z-orders for
     
     Returns:
-        int: -1 if hwnd1 is above hwnd2, 1 if hwnd1 is below hwnd2, 0 if same or error
+        dict: {hwnd -> relative_z_order} where 0 = frontmost tracked window
     """
     try:
-        if not hwnd1 or not hwnd2:
-            return 0
+        import winUser
+        import ctypes
         
-        if hwnd1 == hwnd2:
-            return 0
+        # Convert to set for fast lookup
+        tracked_hwnds = set(hwnds)
+        if not tracked_hwnds:
+            return {}
         
-        z1 = get_window_z_order(hwnd1)
-        z2 = get_window_z_order(hwnd2)
+        # GW_HWNDNEXT = 2 (get next window in z-order, going back)
+        GW_HWNDNEXT = 2
         
-        if z1 < 0 or z2 < 0:
-            return 0
+        # Use GetTopWindow to get the topmost window reliably
+        # GetTopWindow(NULL) returns the topmost top-level window
+        try:
+            user32 = ctypes.windll.user32
+            current_hwnd = user32.GetTopWindow(0)  # 0 = desktop
+        except Exception as e:
+            logMessage(f"[get_relative_z_orders] GetTopWindow failed: {e}")
+            return {hwnd: 999 for hwnd in tracked_hwnds}
         
-        if z1 < z2:
-            return -1  # hwnd1 is above (closer to front)
-        elif z1 > z2:
-            return 1   # hwnd1 is below (farther from front)
-        else:
-            return 0
+        if not current_hwnd:
+            logMessage("[get_relative_z_orders] GetTopWindow returned NULL")
+            return {hwnd: 999 for hwnd in tracked_hwnds}
+        
+        # Traverse z-order and assign positions to tracked windows
+        z_order_map = {}
+        relative_position = 0
+        max_iterations = 2000  # Safety limit (increased for more windows)
+        iterations = 0
+        visited = set()  # Detect cycles
+        
+        while current_hwnd and iterations < max_iterations:
+            # Detect cycles
+            if current_hwnd in visited:
+                logMessage(f"[get_relative_z_orders] Cycle detected at hwnd {current_hwnd}")
+                break
+            visited.add(current_hwnd)
+            
+            # If this window is one we're tracking, assign it a relative position
+            if current_hwnd in tracked_hwnds:
+                z_order_map[current_hwnd] = relative_position
+                relative_position += 1
+                
+                # If we've found all tracked windows, we can stop
+                if len(z_order_map) == len(tracked_hwnds):
+                    break
+            
+            # Move to next window in z-order (going towards back)
+            try:
+                current_hwnd = winUser.getWindow(current_hwnd, GW_HWNDNEXT)
+            except Exception as e:
+                logMessage(f"[get_relative_z_orders] getWindow failed at iteration {iterations}: {e}")
+                break
+            
+            iterations += 1
+        
+        # Log results for debugging
+        if len(z_order_map) < len(tracked_hwnds):
+            missing = [hwnd for hwnd in tracked_hwnds if hwnd not in z_order_map]
+            logMessage(f"[get_relative_z_orders] Found {len(z_order_map)}/{len(tracked_hwnds)} tracked windows after scanning {iterations}. Missing: {missing[:5]}")  # Only log first 5
+        
+        # Assign default z-order to any windows we didn't find
+        for hwnd in tracked_hwnds:
+            if hwnd not in z_order_map:
+                z_order_map[hwnd] = 999
+        
+        return z_order_map
+        
     except Exception as e:
-        logMessage(f"Error comparing window z-order: {e}")
-        return 0
+        logMessage(f"[get_relative_z_orders] Error: {e}")
+        import traceback
+        logMessage(f"[get_relative_z_orders] Traceback: {traceback.format_exc()}")
+        # Return default fallback
+        return {hwnd: 999 for hwnd in hwnds}
 
 def get_object_window_handle(obj):
     """Get the window handle from an NVDA object.
@@ -354,66 +451,6 @@ def get_window_rect(hwnd):
         logMessage(f"Error getting window rect: {e}")
         return None
 
-def is_window_occluded(hwnd, obj_location=None):
-    """Check if a window (or object region within it) is completely occluded by windows in front.
-    
-    Args:
-        hwnd: Window handle to check
-        obj_location: Optional object location namedtuple to check specific region
-    
-    Returns:
-        bool: True if completely occluded, False otherwise
-    """
-    try:
-        if not hwnd:
-            return False
-        
-        # Get the region to check (either object location or full window)
-        if obj_location:
-            check_rect = obj_location.copy()
-        else:
-            check_rect = get_window_rect(hwnd)
-            if not check_rect:
-                return False
-            
-        # Get z-order of this window
-        z_order = get_window_z_order(hwnd)
-        if z_order < 0:
-            return False
-        
-        # GW_HWNDPREV = 3 (get window above this one in z-order)
-        GW_HWNDPREV = 3
-        
-        # Check all windows in front (lower z-order)
-        current_hwnd = hwnd
-        for _ in range(z_order):  # Only check windows in front
-            prev_hwnd = winUser.getWindow(current_hwnd, GW_HWNDPREV)
-            if not prev_hwnd:
-                break
-            
-            # Get the rect of the window in front
-            front_rect = get_window_rect(prev_hwnd)
-            if not front_rect:
-                current_hwnd = prev_hwnd
-                continue
-            
-            # Check if this window in front completely covers our region
-            if (front_rect.contains(check_rect)):
-                # This window completely covers our region
-                # Check if it's visible (not minimized)
-                try:
-                    if winUser.isWindowVisible(prev_hwnd):
-                        return True
-                except:
-                    pass
-            
-            current_hwnd = prev_hwnd
-        
-        return False
-    except Exception as e:
-        logMessage(f"Error checking window occlusion: {e}")
-        return False
-    
 def get_actual_border_mask(rect, image_shape):
     """Generate a boolean mask for only the actual borders of a rectangle that fall within image bounds.
     
@@ -458,4 +495,60 @@ def get_actual_border_mask(rect, image_shape):
         if x_start < x_end:
             mask[rect.bottom - 1, x_start:x_end] = True
     
-    return mask    
+    return mask
+
+def update_window_z_orders(window_z_orders):
+    """Update z-order values for all tracked windows using absolute ordering.
+    
+    Gets the absolute z-order position for each window (counting windows above it),
+    then normalizes to relative positions among tracked windows.
+    Desktop/shell windows are assigned a high z-order so they don't occlude.
+    
+    Args:
+        window_z_orders: Dictionary mapping hwnd -> z-order to update in-place
+    """
+    try:
+        if not window_z_orders:
+            return
+        
+        # Separate desktop/shell windows from regular windows
+        desktop_windows = []
+        regular_windows = []
+        
+        # Get absolute z-order for each tracked window
+        absolute_z_orders = {}
+        for hwnd in window_z_orders.keys():
+            if is_desktop_or_shell_window(hwnd):
+                desktop_windows.append(hwnd)
+                # Assign very high z-order to desktop windows (always in back)
+                window_z_orders[hwnd] = 9998
+            else:
+                regular_windows.append(hwnd)
+                z_order = get_window_z_order(hwnd)
+                if z_order >= 0:
+                    absolute_z_orders[hwnd] = z_order
+                else:
+                    absolute_z_orders[hwnd] = 9999  # Invalid/hidden window
+        
+        # Sort regular windows by absolute z-order and assign relative positions
+        sorted_windows = sorted(absolute_z_orders.items(), key=lambda x: x[1])
+        
+        # Assign relative z-orders (0 = frontmost among tracked regular windows)
+        for relative_pos, (hwnd, absolute_pos) in enumerate(sorted_windows):
+            if absolute_pos == 9999:
+                window_z_orders[hwnd] = 999  # Mark as unknown
+            else:
+                window_z_orders[hwnd] = relative_pos
+        
+        # Log results
+        valid_z_orders = {hwnd: z for hwnd, z in window_z_orders.items() if z < 999}
+        unknown_count = sum(1 for z in window_z_orders.values() if z >= 999)
+        desktop_count = len(desktop_windows)
+        
+        if valid_z_orders:
+            logMessage(f"[update_window_z_orders] Valid z-orders: {valid_z_orders}, Desktop: {desktop_count}, Unknown: {unknown_count}")
+        elif unknown_count > 0:
+            logMessage(f"[update_window_z_orders] All {unknown_count} windows have unknown z-order")
+        
+    except Exception as e:
+        logMessage(f"Error updating window z-orders: {e}")

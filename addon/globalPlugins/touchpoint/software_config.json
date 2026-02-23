@@ -5,7 +5,7 @@
   },
   "layer_multipliers": {
     "object_mesh": 1.5,
-    "depth": 20.0,
+    "depth": 50.0,
     "texture": 1.0
   },
   "threading": {

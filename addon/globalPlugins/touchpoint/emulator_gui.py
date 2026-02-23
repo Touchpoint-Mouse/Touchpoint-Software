@@ -47,6 +47,10 @@ class TouchpointEmulatorGUI:
         self.aspect_ratio = 1.0  # Width/height ratio for display area
         self.current_layer_id = None  # Currently selected layer
         
+        # Label tracking for debug log - organized by label
+        self.label_info = {}  # {label: {'name': str, 'role': str, 'value': str, 'bbox': str}}
+        self.label_info_lock = threading.Lock()
+        
         # Update timer
         self.timer = None
         
@@ -285,15 +289,59 @@ class TouchpointEmulatorGUI:
         if self.is_open and self.frame:
             wx.CallAfter(self._add_vibration_log, amplitude, frequency, duration)
     
+    def add_label_to_log(self, label, name, role, value, bbox):
+        """Add or update a label in the debug log.
+        
+        Args:
+            label: Label number
+            name: Object name
+            role: Object role string
+            value: Object value
+            bbox: Bounding box string
+        """
+        with self.label_info_lock:
+            self.label_info[label] = {
+                'name': name,
+                'role': role,
+                'value': value,
+                'bbox': bbox
+            }
+        
+        # Update display if window is open
+        if self.is_open and self.frame:
+            wx.CallAfter(self._update_label_list)
+    
+    def remove_label_from_log(self, label):
+        """Remove a label from the debug log.
+        
+        Args:
+            label: Label number to remove
+        """
+        with self.label_info_lock:
+            if label in self.label_info:
+                del self.label_info[label]
+        
+        # Update display if window is open
+        if self.is_open and self.frame:
+            wx.CallAfter(self._update_label_list)
+    
+    def clear_label_log(self):
+        """Clear all labels from the debug log."""
+        with self.label_info_lock:
+            self.label_info.clear()
+        
+        # Update display if window is open
+        if self.is_open and self.frame:
+            wx.CallAfter(self._update_label_list)
+    
     def log_debug(self, message):
-        """Add debug message to log.
+        """Add debug message to log (legacy method, kept for compatibility).
         
         Args:
             message: Debug message string
         """
-        # Add to debug log if window is open
-        if self.is_open and self.frame:
-            wx.CallAfter(self._add_debug_log, message)
+        # For now, do nothing - using label list instead
+        pass
     
     def update_layer_image(self, layer_id, image):
         """Update a layer's image data.
@@ -337,29 +385,34 @@ class TouchpointEmulatorGUI:
         except Exception as e:
             logMessage(f"[ERROR] Failed to add vibration log: {e}")
     
-    def _add_debug_log(self, message):
-        """Add debug message to log."""
+    def _update_label_list(self):
+        """Update the debug log display with current label map."""
         try:
-            current_time = time.time()
-            timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
-            milliseconds = int((current_time % 1) * 1000)
-            timestamp_with_ms = f"{timestamp}.{milliseconds:03d}"
+            with self.label_info_lock:
+                # Build the display text organized by label
+                lines = []
+                lines.append(f"=== Object Label Map ({len(self.label_info)} objects) ===")
+                lines.append("")
+                
+                # Sort by label number
+                for label in sorted(self.label_info.keys()):
+                    info = self.label_info[label]
+                    # Handle None values safely
+                    role = info.get('role', 'Unknown') or 'Unknown'
+                    name = info.get('name', 'Unknown') or 'Unknown'
+                    value = info.get('value', 'N/A') or 'N/A'
+                    bbox = info.get('bbox', 'N/A') or 'N/A'
+                    
+                    line = f"Label {label:3d} | {role[:15]:15s} | {name[:30]:30s} | {value[:20]:20s} | {bbox}"
+                    lines.append(line)
+                
+                display_text = "\n".join(lines)
             
-            log_entry = f"[{timestamp_with_ms}] {message}\n"
+            # Update the text control
+            self.debug_log.SetValue(display_text)
             
-            self.debug_log.AppendText(log_entry)
-            
-            # Limit log to last 100 lines
-            line_count = self.debug_log.GetNumberOfLines()
-            if line_count > 100:
-                # Remove first line
-                first_line_end = self.debug_log.XYToPosition(0, 1)
-                self.debug_log.Remove(0, first_line_end)
-            
-            # Scroll to the end to show the latest entry
-            self.debug_log.SetInsertionPointEnd()
         except Exception as e:
-            logMessage(f"[ERROR] Failed to add debug log: {e}")
+            logMessage(f"[ERROR] Failed to update label list: {e}")
     
     def _update_connection_status(self):
         """Update the connection status labels."""

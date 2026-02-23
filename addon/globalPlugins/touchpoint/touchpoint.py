@@ -15,7 +15,7 @@ import time
 import sys
 import os
 import ctypes
-from .utils import Rect, logMessage, logUIElement
+from .utils import Rect, logMessage, logUIElement, update_window_z_orders
 from .render_pipeline import RenderPipeline
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
@@ -65,6 +65,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Mouse position tracking (updated by event thread)
         self.mouse_position = (0, 0)
         self.mouse_position_lock = threading.Lock()
+        
+        # Debug logging timer
+        self.last_debug_log_time = 0
         
         # Get full screen size
         self.screen_size = (ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1))  # (SM_CXSCREEN, SM_CYSCREEN)
@@ -120,6 +123,60 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         with self.mouse_position_lock:
             return self.mouse_position
+    
+    def _log_object_under_mouse(self, mouse_pos):
+        """Log information about the object under the mouse cursor.
+        
+        Args:
+            mouse_pos: Tuple (x, y) of mouse position in screen coordinates
+        """
+        try:
+            # Get object layer
+            object_layer = self.render_pipeline.object_layer
+            
+            # Convert mouse position to object layer local coordinates
+            region = object_layer.current_region
+            local_x = mouse_pos[0] - region.left
+            local_y = mouse_pos[1] - region.top
+            
+            # Check if local position is within the layer bounds
+            if local_x < 0 or local_y < 0 or local_x >= region.width or local_y >= region.height:
+                return
+            
+            # Get the label at this position
+            object_img = object_layer.get_image()
+            if object_img.size == 0:
+                return
+            
+            if local_y >= object_img.shape[0] or local_x >= object_img.shape[1]:
+                return
+            
+            label = object_img[local_y, local_x]
+            
+            if label == 0:
+                # No object
+                return
+            
+            # Get label data
+            label_data = object_layer.label_map.get(label)
+            if label_data is None:
+                return
+            
+            # Extract object info
+            obj_info = label_data.get('obj_info', {})
+            obj = obj_info.get('object')
+            obj_name = obj_info.get('name', 'Unknown')
+            obj_role = obj_info.get('role', 'Unknown')
+            obj_value = getattr(obj, 'value', 'N/A') if obj else 'N/A'
+            location = label_data.get('location')
+            
+            # Format log message
+            log_msg = f"Label: {label} | Name: {obj_name} | Role: {obj_role} | Value: {obj_value} | Location: {location}"
+            self.hardware.send_debug_log(log_msg)
+            
+        except Exception as e:
+            # Silently ignore errors to avoid flooding logs
+            pass
     
     def get_screen_size(self):
         """Get the full screen size as (width, height)."""
@@ -210,6 +267,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             obj: The window object
             nextHandler: The next event handler in the chain
         """
+        # Update z-orders for all tracked windows when any window gains focus
+        if hasattr(self, 'render_pipeline') and hasattr(self.render_pipeline, 'object_layer'):
+            update_window_z_orders(self.render_pipeline.object_layer.window_z_orders)
+            self.render_pipeline.object_layer.update_z_order_lookups()
+        
         # logUIElement(obj, "foreground")
         # Calls matching object handlers
         self.render_pipeline.object_handler_manager.dispatch_event('foreground', obj)

@@ -98,11 +98,11 @@ class RenderPipeline:
             ScreenBorderHandler(effects={
                 'border_enter': ComboEffect([
                     VibrationEffect(0.1, 200.0, 0),
-                    lambda effect, **kwargs: logMessage("Screen border entered")
+                    lambda effect, obj=None, **kwargs: logMessage("Screen border entered")
                 ]),
                 'border_leave': ComboEffect([
                     VibrationEffect(0, 0, 0),
-                    lambda effect, **kwargs: logMessage("Screen border left")
+                    lambda effect, obj=None, **kwargs: logMessage("Screen border left")
                 ])
             })
         ]

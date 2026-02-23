@@ -2,7 +2,7 @@ import math
 import threading
 import controlTypes
 from .dependencies import np, cv2
-from .utils import Rect, logMessage, is_window_occluded, get_actual_border_mask, get_object_window_handle, get_window_z_order
+from .utils import Rect, logMessage, get_actual_border_mask, get_object_window_handle, get_window_z_order
 import time
 import traceback
 from collections import namedtuple
@@ -165,10 +165,83 @@ class ObjectRenderer(Renderer):
             capture_layer: CaptureLayer to read from
             object_layer: ObjectLayer to write object labels to
         """
+        super().__init__()
         self.capture_layer = capture_layer
         self.object_layer = object_layer
     
-    def _invalidate_and_collect_existing_objects(self, region, prev_region, overlap_region, diff_mask):
+    def _check_occlusion(self, hwnd, obj_location, capture_region):
+        """Check if a window/object is completely occluded by windows in front using cached z-orders.
+        
+        Args:
+            hwnd: Window handle to check
+            obj_location: Object location Rect to check
+            capture_region: Capture region Rect to constrain the check
+            
+        Returns:
+            bool: True if completely occluded, False otherwise
+        """
+        try:
+            from .utils import get_window_rect
+            import winUser
+            
+            if not hwnd or obj_location is None:
+                return False
+            
+            # Get the region to check within capture region
+            check_rect = obj_location.copy()
+            visible_rect = check_rect.intersection(capture_region)
+            if not visible_rect:
+                # No intersection with capture region - consider it occluded (not visible)
+                return True
+            
+            # Get z-order from cached values
+            target_z_order = self.object_layer.window_z_orders.get(hwnd, 999)
+            if target_z_order < 0:
+                return False
+            
+            # If z-order is still 999 (placeholder), update z-orders now
+            if target_z_order == 999:
+                from .utils import update_window_z_orders
+                logMessage(f"[ObjectRenderer] Z-order not set for hwnd {hwnd}, updating all z-orders")
+                update_window_z_orders(self.object_layer.window_z_orders)
+                self.object_layer.update_z_order_lookups()
+                target_z_order = self.object_layer.window_z_orders.get(hwnd, 999)
+                if target_z_order == 999:
+                    logMessage(f"[ObjectRenderer] Z-order still 999 after update for hwnd {hwnd}, skipping occlusion check")
+                    return False
+            
+            # Check all tracked windows that are in front (lower z-order)
+            for other_hwnd, other_z_order in self.object_layer.window_z_orders.items():
+                if other_hwnd == hwnd:
+                    continue
+                
+                # Only check windows in front (desktop/shell windows have z-order 9998)
+                # Skip windows with z-order >= 9998
+                if other_z_order >= 9998:
+                    continue
+                    
+                if other_z_order < target_z_order:
+                    # Get the rect of the window in front
+                    front_rect = get_window_rect(other_hwnd)
+                    if not front_rect:
+                        continue
+                    
+                    # Check if this window in front completely covers our region
+                    if front_rect.contains(visible_rect):
+                        # Check if it's visible (not minimized)
+                        try:
+                            if winUser.isWindowVisible(other_hwnd):
+                                logMessage(f"[ObjectRenderer] Occlusion: hwnd {hwnd} (z={target_z_order}) covered by hwnd {other_hwnd} (z={other_z_order})")
+                                return True
+                        except:
+                            pass
+            
+            return False
+        except Exception as e:
+            logMessage(f"Error checking window occlusion: {e}")
+            return False
+    
+    def _invalidate_and_collect_existing_objects(self, region, overlap_region, diff_mask):
         """Invalidate stale objects and collect remaining valid ones.
         
         Args:
@@ -178,32 +251,23 @@ class ObjectRenderer(Renderer):
             diff_mask: Boolean mask of changed pixels
             
         Returns:
-            tuple: (objects_needing_redraw, objects_fully_in_overlap) as lists of (label, location) tuples
+            list: List of (label, location) tuples for objects needing redraw
         """
         objects_needing_redraw = []
-        objects_fully_in_overlap = []
         labels_removed = 0
         
         for label, label_data in list(self.object_layer.label_map.items()):
-            location = label_data['location']
-            hwnd = label_data['hwnd']
+            location = label_data.location
+            hwnd = label_data.hwnd
             
             if location is None:
                 continue
             
-            # Check if this object is completely occluded by windows in front
-            if is_window_occluded(hwnd, location):
+            # Check if this object is completely occluded by windows in front within the capture region
+            # (This also handles out of bounds - objects outside capture region are considered occluded)
+            if self._check_occlusion(hwnd, location, region):
                 self.object_layer.remove_label(label)
-                labels_removed += 1
-                #logMessage(f"[ObjectRenderer] Removed occluded label {label} from window {hwnd}")
-                continue
-            
-            # Check if object is within current capture region
-            if not location.intersects(region):
-                # Object completely outside current region - remove it
-                self.object_layer.remove_label(label)
-                labels_removed += 1
-                #logMessage(f"[ObjectRenderer] Removed out-of-bounds label {label}")
+                # Logging moved to _check_occlusion for detailed info
                 continue
             
             # Only check for invalidation if object intersects the overlap region
@@ -232,7 +296,7 @@ class ObjectRenderer(Renderer):
                 
                 if border_changed:
                     # Before invalidating, try to reacquire object from its mesh point
-                    mesh_point = label_data.get('mesh_point')
+                    mesh_point = label_data.mesh_point
                     should_invalidate = True
                     
                     if mesh_point is not None:
@@ -256,43 +320,38 @@ class ObjectRenderer(Renderer):
                                 
                                 if reacquired_obj_nvda and reacquired_hwnd and reacquired_location:
                                     # Check if reacquired object is a duplicate of the existing label
+                                    # Use fast role-based check during reacquisition (skip expensive window validation)
                                     duplicate_label = self.object_layer._check_duplicate_object(
-                                        reacquired_obj_info, reacquired_hwnd, reacquired_location
+                                        reacquired_obj_info, reacquired_hwnd, reacquired_location, 
+                                        check_window_validation=False
                                     )
                                     
                                     if duplicate_label == label:
                                         # Same object still at the same location - don't invalidate
                                         should_invalidate = False
-                                        debug_msg = f"Reacquired label {label} from mesh point {mesh_point} - border changed but object unchanged"
-                                        self.plugin.hardware.send_debug_log(debug_msg)
+                                        obj_name = label_data.obj_info.get('name', 'Unknown')[:20] if label_data.obj_info else 'Unknown'
+                                        logMessage(f"[ObjectRenderer] Reacquired label {label} '{obj_name}' - border changed but object unchanged")
+                                    else:
+                                        obj_name = label_data.obj_info.get('name', 'Unknown')[:20] if label_data.obj_info else 'Unknown'
+                                        logMessage(f"[ObjectRenderer] Label {label} '{obj_name}' border changed - duplicate_label={duplicate_label}, will invalidate")
                         except Exception as e:
                             # If reacquisition fails, proceed with invalidation
+                            obj_name = label_data.obj_info.get('name', 'Unknown')[:20] if label_data.obj_info else 'Unknown'
+                            logMessage(f"[ObjectRenderer] Reacquisition failed for label {label} '{obj_name}': {e}")
                             pass
                     
                     if should_invalidate:
                         # Border pixels changed - invalidate this object
                         self.object_layer.remove_label(label)
-                        labels_removed += 1
-                        #logMessage(f"[ObjectRenderer] Removed invalidated label {label} (border changed)")
-                        # Log object name, role, and value to debug log
-                        obj_info = label_data.get('obj_info', {})
-                        obj = obj_info.get('object')
-                        obj_value = getattr(obj, 'value', 'N/A') if obj else 'N/A'
-                        debug_msg = f"Invalidated label {label} (name: {obj_info.get('name', 'Unknown')}, role: {obj_info.get('role', 'Unknown')}, value: {obj_value}), location: {location}"
-                        self.plugin.hardware.send_debug_log(debug_msg)
+                        obj_name = label_data.obj_info.get('name', 'Unknown')[:20] if label_data.obj_info else 'Unknown'
+                        logMessage(f"[ObjectRenderer] Invalidated label {label} '{obj_name}' - border changed")
                         continue
             
-            # Object not invalidated - determine if it needs redrawing
-            # Objects fully inside overlap region can keep their pixels
-            # Objects extending outside overlap need redrawing for new visible areas
-            if overlap_region and overlap_region.contains(location):
-                # Object fully inside overlap region - pixels are still valid
-                objects_fully_in_overlap.append((label, location))
-            else:
-                # Object extends outside overlap or overlap is None - needs redrawing
-                objects_needing_redraw.append((label, location))
+            # Object not invalidated - add to redraw list
+            # Redraw all non-invalidated objects regardless of overlap
+            objects_needing_redraw.append((label, location))
         
-        return objects_needing_redraw, objects_fully_in_overlap
+        return objects_needing_redraw
     
     def _detect_object_at_point(self, x, y, region, mesh_width, mesh_height, current_object_image):
         """Detect and validate NVDA object at a specific screen point.
@@ -390,8 +449,9 @@ class ObjectRenderer(Renderer):
                 )
                 
                 if new_label > 0:
-                    # Use location from label_map (converted to Rect) instead of raw NVDA location
-                    stored_location = self.object_layer.label_map.get(new_label, {}).get('location')
+                    # Use location from label_map (TreeNode) instead of raw NVDA location
+                    node = self.object_layer.label_map.get(new_label)
+                    stored_location = node.location if node else None
                     new_detections.append((new_label, stored_location))
         
         return new_detections
@@ -425,8 +485,8 @@ class ObjectRenderer(Renderer):
             mesh_width, mesh_height = mesh_dims
             
             # Invalidate stale objects and separate into those needing redraw vs those fully in overlap
-            objects_needing_redraw, objects_fully_in_overlap = self._invalidate_and_collect_existing_objects(
-                region, prev_region, overlap_region, diff_mask
+            objects_needing_redraw = self._invalidate_and_collect_existing_objects(
+                region, overlap_region, diff_mask
             )
             
             # Get current object image for mesh grid detection
@@ -605,6 +665,8 @@ class RenderLayer:
         self.constant_size = constant_size
         # Number of channels (1 for grayscale, 3 for BGR)
         self.num_channels = num_channels
+        # Store dtype for consistent array creation
+        self.dtype = dtype
         
         # Render image
         self.image = np.array([], dtype=dtype)  # Placeholder for the rendered image data
@@ -730,7 +792,8 @@ class RenderLayer:
             target_height = new_region.height
         
         # Initialize new image and difference mask
-        dtype = old_image.dtype if old_image is not None else np.uint8
+        # Use the layer's stored dtype (set during __init__)
+        dtype = self.dtype
         # Use stored num_channels from layer initialization
         num_channels = self.num_channels
         
@@ -741,9 +804,25 @@ class RenderLayer:
         
         # If we have an old image, copy overlapping region
         if old_image is not None and old_image.size > 0:
-            # Calculate relative offset (how much the region moved)
-            dx = new_region.left - old_region.left
-            dy = new_region.top - old_region.top
+            # Calculate relative offset (how much the region moved in screen coordinates)
+            dx_screen = new_region.left - old_region.left
+            dy_screen = new_region.top - old_region.top
+            
+            # For constant_size layers, scale the screen offset to layer coordinates
+            # E.g., if depth layer is 20x20 representing a 400x400 screen region,
+            # moving 10 screen pixels should only shift 0.5 layer pixels
+            if self.constant_size:
+                # Calculate scaling factors
+                scale_x = target_width / old_region.width if old_region.width > 0 else 1.0
+                scale_y = target_height / old_region.height if old_region.height > 0 else 1.0
+                
+                # Scale offsets to layer coordinates
+                dx = int(round(dx_screen * scale_x))
+                dy = int(round(dy_screen * scale_y))
+            else:
+                # Dynamic-size layers use screen offsets directly
+                dx = dx_screen
+                dy = dy_screen
             
             # Get copy width (minimum of old and new image dimensions adjusted for offset)
             copy_width = min(old_image.shape[1] - abs(dx), target_width)
@@ -798,14 +877,84 @@ class SemanticLayer(RenderLayer):
         if self.next_label > 255:
             self.next_label = 1
         return label
+
+
+class TreeNode:
+    """Node in the object hierarchy tree.
+    
+    Each node represents an object and tracks its parent-child relationships.
+    """
+    def __init__(self, label, obj_info, location, depth, hwnd, mesh_point=None):
+        self.label = label
+        self.obj_info = obj_info
+        self.location = location
+        self.depth = depth
+        self.hwnd = hwnd
+        self.mesh_point = mesh_point
+        self.parent = None  # Reference to parent TreeNode
+        self.children = []  # List of child TreeNode references
+    
+    def add_child(self, child_node):
+        """Add a child node and set its parent reference."""
+        if child_node not in self.children:
+            self.children.append(child_node)
+            child_node.parent = self
+    
+    def remove_child(self, child_node):
+        """Remove a child node and clear its parent reference."""
+        if child_node in self.children:
+            self.children.remove(child_node)
+            child_node.parent = None
+    
+    def contains(self, other_node):
+        """Check if this node's bounding box contains another node's box."""
+        if not self.location or not other_node.location:
+            return False
+        return self.location.contains(other_node.location)
+    
+    def update_depth_recursively(self, new_depth, object_layer):
+        """Recursively update depth for this node and all descendants.
+        
+        This requires reallocating labels when depth changes.
+        
+        Args:
+            new_depth: The new depth to set for this node
+            object_layer: ObjectLayer instance for reallocating labels
+        """
+        # Reallocate label if depth changed
+        if self.depth != new_depth:
+            object_layer._reallocate_node_label(self, new_depth)
+        
+        # Recursively update children
+        for child in self.children:
+            child.update_depth_recursively(new_depth + 1, object_layer)
+    
+    def get_all_descendants(self):
+        """Get all descendant nodes (children, grandchildren, etc.).
+        
+        Returns:
+            list: All TreeNode descendants
+        """
+        descendants = []
+        for child in self.children:
+            descendants.append(child)
+            descendants.extend(child.get_all_descendants())
+        return descendants
+    
+    def __repr__(self):
+        """String representation for debugging."""
+        name = self.obj_info.get('name', 'Unknown')[:20]
+        return f"TreeNode(label={self.label}, depth={self.depth}, name='{name}', children={len(self.children)})"
+
     
 class ObjectLayer(RenderLayer):
     """Render layer that stores object label information with depth-based allocation."""
     
     def __init__(self, id, constant_size=None, max_depth=5, labels_per_depth=50):
         super().__init__(id, dtype=np.uint16, constant_size=constant_size, num_channels=1)
-        # Flat dict mapping label -> object info with depth tracking
-        self.label_map = {}  # label -> {'obj_info': dict, 'location': Rect, 'depth': int, 'hwnd': int}
+        # Tree structure: label -> TreeNode (unified structure)
+        self.label_map = {}  # label -> TreeNode
+        self.window_roots = {}  # hwnd -> TreeNode (root node for each window)
         
         # Window tracking for z-order and root management
         self.window_z_orders = {}  # hwnd -> z-order position (0 = topmost)
@@ -815,6 +964,11 @@ class ObjectLayer(RenderLayer):
         self.max_depth = max_depth  # Maximum supported depth levels (configurable)
         self.labels_per_depth = labels_per_depth  # Fixed allocation per depth level (configurable)
         self.depth_counters = {}  # depth_level -> next available label in that depth's range
+        
+        # Fast lookup arrays for efficient fill_object_region
+        max_labels = (max_depth + 1) * labels_per_depth
+        self.label_to_hwnd = np.zeros(max_labels + 1, dtype=np.int64)  # label -> hwnd for O(1) lookup (int64 for 64-bit handles)
+        self.label_to_zorder = np.full(max_labels + 1, 999, dtype=np.int16)  # label -> z-order for O(1) lookup
         
     def _get_or_create_window_label(self, hwnd, window_obj=None):
         """Get or create label for window at depth level 0.
@@ -826,16 +980,17 @@ class ObjectLayer(RenderLayer):
         Returns:
             int: Window label (depth 0)
         """
-        from .utils import get_window_z_order, get_window_rect
+        from .utils import get_window_rect, update_window_z_orders
         
         # Check if window already has a label
         if hwnd in self.window_labels:
             return self.window_labels[hwnd]
         
-        # Track window z-order
+        # Add window to z-order tracking and get actual z-order
         if hwnd not in self.window_z_orders:
-            window_z_order = get_window_z_order(hwnd)
-            self.window_z_orders[hwnd] = window_z_order if window_z_order >= 0 else 999
+            self.window_z_orders[hwnd] = 999  # Temporary value before update
+            update_window_z_orders(self.window_z_orders)
+            self.update_z_order_lookups()
         
         # Allocate label for window at depth level 0
         window_label = self._calculate_label_for_depth(0)
@@ -846,13 +1001,13 @@ class ObjectLayer(RenderLayer):
         # Create window object info
         window_info = {
             'name': f'Window {hwnd}',
-            'role': None,  # Will be set if window_obj provided
+            'role': 15,  # Default to WINDOW role (15 in NVDA controlTypes)
             'hwnd': hwnd
         }
         
         if window_obj:
             window_info['name'] = window_obj.name if hasattr(window_obj, 'name') else f'Window {hwnd}'
-            window_info['role'] = window_obj.role if hasattr(window_obj, 'role') else None
+            window_info['role'] = window_obj.role if hasattr(window_obj, 'role') else 15
             window_info['object'] = window_obj
         
         # Get window location
@@ -863,18 +1018,124 @@ class ObjectLayer(RenderLayer):
         else:
             window_location = None
         
-        # Store window in label map at depth 0
-        self.label_map[window_label] = {
-            'obj_info': window_info,
-            'location': window_location,
-            'depth': 0,
-            'hwnd': hwnd
-        }
+        # Create TreeNode for window (root node at depth 0)
+        window_node = TreeNode(
+            label=window_label,
+            obj_info=window_info,
+            location=window_location,
+            depth=0,
+            hwnd=hwnd,
+            mesh_point=None
+        )
+        
+        # Store node in label_map
+        self.label_map[window_label] = window_node
+        self.window_roots[hwnd] = window_node
+        
+        # Update fast lookup arrays with actual z-order
+        if window_label < len(self.label_to_hwnd):
+            self.label_to_hwnd[window_label] = hwnd
+            self.label_to_zorder[window_label] = self.window_z_orders.get(hwnd, 999)
         
         self.window_labels[hwnd] = window_label
-        #logMessage(f"[ObjectLayer] Created window label {window_label} for hwnd {hwnd} at depth 0")
+        
+        # Add to emulator debug log
+        if self.plugin:
+            window_name = window_info.get('name', f'Window {hwnd}') or f'Window {hwnd}'
+            role = window_info.get('role')
+            
+            # Get human-readable role name
+            if role is not None:
+                try:
+                    role_str = controlTypes.Role(role).displayString
+                except:
+                    try:
+                        role_str = controlTypes.roleLabels.get(role, f"Unknown({role})")
+                    except:
+                        role_str = str(role)
+            else:
+                role_str = "Window"
+            
+            # Ensure role_str is a string
+            role_str = str(role_str) if role_str else "Window"
+            
+            # Convert location to bbox string
+            if window_location and hasattr(window_location, 'left'):
+                bbox = f"({window_location.left}, {window_location.top}, {window_location.width}, {window_location.height})"
+            else:
+                bbox = "N/A"
+            
+            # Check if this is a desktop/shell window
+            from .utils import is_desktop_or_shell_window
+            if is_desktop_or_shell_window(hwnd):
+                logMessage(f"[ObjectLayer] Created desktop/shell window label {window_label} for hwnd {hwnd}, bbox={bbox}")
+            
+            self.plugin.hardware.add_label_to_debug(window_label, window_name, role_str, "N/A", bbox)
         
         return window_label
+    
+    def _is_actually_window(self, obj, obj_info, obj_hwnd, location_rect):
+        """Check if object is actually a window, not just based on role.
+        
+        Verifies:
+        1. Role is WINDOW (15) or DIALOG (16)
+        2. Object location approximately matches the window bounds
+        
+        Args:
+            obj: NVDA object
+            obj_info: Object information dict
+            obj_hwnd: Window handle
+            location_rect: Object location as Rect
+            
+        Returns:
+            bool: True if this is actually the window object
+        """
+        try:
+            from .utils import get_window_rect
+            
+            obj_role = obj_info.get('role')
+            
+            # Must have window role
+            if obj_role not in (15, 16):
+                return False
+            
+            # If we can't get location, can't verify
+            if not location_rect or not obj_hwnd:
+                return False
+            
+            # Get actual window bounds
+            window_rect = get_window_rect(obj_hwnd)
+            if not window_rect:
+                return False
+            
+            # Check if object bounds approximately match window bounds
+            # Allow small tolerance for window decorations
+            tolerance = 10
+            width_match = abs(location_rect.width - window_rect.width) <= tolerance
+            height_match = abs(location_rect.height - window_rect.height) <= tolerance
+            left_match = abs(location_rect.left - window_rect.left) <= tolerance
+            top_match = abs(location_rect.top - window_rect.top) <= tolerance
+            
+            is_match = width_match and height_match and left_match and top_match
+            
+            # Don't log - this is expected for list items and other role=15 non-windows
+            # if not is_match:
+            #     logMessage(f"[ObjectLayer] Object '{obj_info.get('name', 'Unknown')[:30]}' has window role but bounds don't match: obj={location_rect}, window={window_rect}")
+            
+            return is_match
+        except Exception as e:
+            logMessage(f"[ObjectLayer] _is_actually_window error for '{obj_info.get('name', 'Unknown')[:20]}': {e}")
+            return False
+    
+    def update_z_order_lookups(self):
+        """Update the label_to_zorder lookup array when window z-orders change.
+        
+        This should be called after window_z_orders dict is updated (e.g., on focus change).
+        """
+        # Update z-order for all labels belonging to tracked windows
+        for label, hwnd in enumerate(self.label_to_hwnd):
+            if hwnd > 0:  # Skip background (0) and unallocated labels
+                self.label_to_zorder[label] = self.window_z_orders.get(hwnd, 999)
     
     def _validate_and_extract_object(self, obj_info):
         """Validate object info and extract window handle and location.
@@ -912,13 +1173,14 @@ class ObjectLayer(RenderLayer):
         
         return obj, obj_hwnd, location_rect
     
-    def _check_duplicate_object(self, obj_info, obj_hwnd, location_rect):
+    def _check_duplicate_object(self, obj_info, obj_hwnd, location_rect, check_window_validation=True):
         """Check if object already exists in label map.
         
         Args:
             obj_info: Object information dictionary
             obj_hwnd: Window handle
             location_rect: Object location as Rect
+            check_window_validation: If False, use simple role check instead of bounds validation
             
         Returns:
             int: Existing label if duplicate found, 0 otherwise
@@ -926,74 +1188,288 @@ class ObjectLayer(RenderLayer):
         if location_rect is None:
             return 0
         
-        for existing_label, existing_data in self.label_map.items():
-            if existing_data['hwnd'] != obj_hwnd:
+        # Determine if incoming object is a window
+        # During reacquisition, use fast role-based check to avoid performance issues
+        if check_window_validation:
+            obj = obj_info.get('object')
+            is_incoming_window = self._is_actually_window(obj, obj_info, obj_hwnd, location_rect)
+        else:
+            # Fast path for reacquisition - just check role
+            incoming_role = obj_info.get('role')
+            is_incoming_window = incoming_role in (15, 16) if incoming_role is not None else False
+        
+        for existing_label, existing_node in self.label_map.items():
+            if existing_node.hwnd != obj_hwnd:
                 continue  # Different window
-            existing_obj_info = existing_data['obj_info']
-            if (existing_obj_info.get('name') == obj_info.get('name') and
-                existing_obj_info.get('role') == obj_info.get('role') and
-                existing_data['location'] == location_rect):
-                return existing_label  # Already exists
+            
+            existing_obj_info = existing_node.obj_info
+            existing_depth = existing_node.depth
+            
+            # Don't match non-windows with depth-0 objects (windows)
+            if not is_incoming_window and existing_depth == 0:
+                continue
+            
+            # Don't match windows with non-depth-0 objects
+            if is_incoming_window and existing_depth != 0:
+                continue
+            
+            # Check name and role match
+            if (existing_obj_info.get('name') != obj_info.get('name') or
+                existing_obj_info.get('role') != obj_info.get('role')):
+                continue
+            
+            # Compare locations exactly (no tolerance)
+            existing_location = existing_node.location
+            if existing_location is None:
+                continue
+            
+            # Check if locations are exactly equal
+            if (existing_location.left == location_rect.left and
+                existing_location.top == location_rect.top and
+                existing_location.width == location_rect.width and
+                existing_location.height == location_rect.height):
+                # Found duplicate
+                return existing_label
         
         return 0
     
-    def _find_parent_in_label_map(self, obj, obj_hwnd, location_rect):
-        """Find parent object in existing label map.
+
+    
+    def _insert_node_into_tree(self, new_node):
+        """Insert a node into the tree, finding its parent or children and updating depths.
         
-        Tries NVDA parent property first, then falls back to spatial containment.
+        This method handles both cases:
+        1. Parent already exists -> Insert as child of parent
+        2. Children exist at default depth -> Adopt children and update their depths recursively
         
         Args:
-            obj: NVDA object
-            obj_hwnd: Window handle
-            location_rect: Object location as Rect
+            new_node: TreeNode to insert into the tree
+        """
+        hwnd = new_node.hwnd
+        
+        # Case 1: Try to find a parent for this node
+        parent_node = self._find_parent_node(new_node)
+        
+        if parent_node:
+            # Found a parent - add this node as child and update depth based on parent
+            parent_node.add_child(new_node)
+            new_node.update_depth_recursively(parent_node.depth + 1, self)
+            
+            # Check if any of the parent's other children should actually be our children
+            # This handles re-adoption when a removed parent comes back
+            siblings_to_adopt = []
+            for sibling in parent_node.children[:]:  # Copy list to avoid modification issues
+                if sibling.label == new_node.label:
+                    continue  # Skip self
+                
+                # Check if this new node should be the parent of this sibling
+                if new_node.contains(sibling):
+                    siblings_to_adopt.append(sibling)
+            
+            # Re-adopt siblings that belong to this node
+            if siblings_to_adopt:
+                for sibling in siblings_to_adopt:
+                    # Remove from parent (grandparent for these nodes)
+                    parent_node.remove_child(sibling)
+                    # Add as child of this node
+                    new_node.add_child(sibling)
+                    # Update depth recursively
+                    sibling.update_depth_recursively(new_node.depth + 1, self)
+                
+                logMessage(f"[ObjectLayer] Node {new_node.label} re-adopted {len(siblings_to_adopt)} siblings from parent {parent_node.label}")
+            
+            logMessage(f"[ObjectLayer] Inserted node {new_node.label} as child of {parent_node.label}, depth={new_node.depth}")
+        else:
+            # Case 2: No parent found - check if this node should adopt any existing children
+            children_to_adopt = self._find_children_nodes(new_node)
+            
+            if children_to_adopt:
+                # This node is a parent to some existing nodes - adopt them and update depths
+                for child_node in children_to_adopt:
+                    # Remove from current parent if it has one
+                    if child_node.parent:
+                        child_node.parent.remove_child(child_node)
+                    
+                    # Add as child of this node
+                    new_node.add_child(child_node)
+                
+                # Recursively update depths starting from this node
+                # If this node has a parent, use parent.depth + 1, otherwise use current depth
+                if new_node.parent:
+                    new_node.update_depth_recursively(new_node.parent.depth + 1, self)
+                else:
+                    # No parent, so keep current depth and update children
+                    for child_node in new_node.children:
+                        child_node.update_depth_recursively(new_node.depth + 1, self)
+                
+                logMessage(f"[ObjectLayer] Node {new_node.label} adopted {len(children_to_adopt)} children, depth={new_node.depth}")
+            else:
+                # No parent and no children - standalone node or direct child of window
+                logMessage(f"[ObjectLayer] Inserted standalone node {new_node.label}, depth={new_node.depth}")
+        
+        # Store node in label_map
+        self.label_map[new_node.label] = new_node
+        
+        # If this is a window (depth 0), store as root
+        if new_node.depth == 0:
+            self.window_roots[hwnd] = new_node
+    
+    def _reallocate_node_label(self, node, new_depth):
+        """Reallocate a node's label when its depth changes.
+        
+        Args:
+            node: TreeNode to reallocate
+            new_depth: New depth level for the node
+        """
+        old_label = node.label
+        old_depth = node.depth
+        
+        # Allocate new label from the new depth range
+        new_label = self._calculate_label_for_depth(new_depth)
+        
+        if new_label == 0:
+            logMessage(f"[ObjectLayer] ERROR: Failed to reallocate label for node {old_label} at new depth {new_depth}")
+            return
+        
+        # Update pixels in the image (remap old label to new label)
+        if self.image.size > 0:
+            self.image[self.image == old_label] = new_label
+        
+        # Update node properties
+        node.label = new_label
+        node.depth = new_depth
+        
+        # Update label_map (remove old entry, add new entry)
+        if old_label in self.label_map:
+            del self.label_map[old_label]
+        self.label_map[new_label] = node
+        
+        # Update fast lookup arrays
+        if old_label < len(self.label_to_hwnd):
+            self.label_to_hwnd[old_label] = 0
+            self.label_to_zorder[old_label] = 999
+        
+        if new_label < len(self.label_to_hwnd):
+            self.label_to_hwnd[new_label] = node.hwnd
+            self.label_to_zorder[new_label] = self.window_z_orders.get(node.hwnd, 999)
+        
+        # Update window_labels if this is a window
+        if old_depth == 0 and node.hwnd in self.window_labels:
+            if self.window_labels[node.hwnd] == old_label:
+                self.window_labels[node.hwnd] = new_label
+        elif new_depth == 0:  # Became a window
+            self.window_labels[node.hwnd] = new_label
+        
+        # Update debug log
+        if self.plugin:
+            self.plugin.hardware.remove_label_from_debug(old_label)
+            
+            obj_name = node.obj_info.get('name', 'Unknown') or 'Unknown'
+            obj = node.obj_info.get('object')
+            obj_value = getattr(obj, 'value', 'N/A') if obj else 'N/A'
+            obj_value = str(obj_value) if obj_value else 'N/A'
+            role = node.obj_info.get('role')
+            
+            # Get human-readable role name
+            if role is not None:
+                try:
+                    role_str = controlTypes.Role(role).displayString
+                except:
+                    try:
+                        role_str = controlTypes.roleLabels.get(role, f"Unknown({role})")
+                    except:
+                        role_str = str(role)
+            else:
+                role_str = "Unknown"
+            
+            role_str = str(role_str) if role_str else "Unknown"
+            
+            # Convert location to bbox string
+            if node.location and hasattr(node.location, 'left'):
+                bbox = f"({node.location.left}, {node.location.top}, {node.location.width}, {node.location.height})"
+            else:
+                bbox = str(node.location) if node.location else "N/A"
+            
+            self.plugin.hardware.add_label_to_debug(new_label, obj_name, role_str, obj_value, bbox)
+        
+        # Recycle the old label position by resetting depth counter if this label is earlier
+        if old_depth in self.depth_counters:
+            # If this freed label is less than the current counter, reset to reuse it
+            if old_label < self.depth_counters[old_depth]:
+                self.depth_counters[old_depth] = old_label
+        
+        logMessage(f"[ObjectLayer] Reallocated node label {old_label} -> {new_label} (depth {old_depth} -> {new_depth})")
+    
+    def _find_parent_node(self, node):
+        """Find the parent node for a given node by spatial containment.
+        
+        Args:
+            node: TreeNode to find parent for
             
         Returns:
-            int: Parent label if found, None otherwise
+            TreeNode: Parent node if found, None otherwise
         """
-        found_parent_label = None
+        if not node.location:
+            return None
         
-        # First, try to use NVDA's parent property
-        if hasattr(obj, 'parent') and obj.parent:
-            parent_obj = obj.parent
-            # Check if parent exists in our label map by matching name, role, location
-            if hasattr(parent_obj, 'location') and parent_obj.location:
-                try:
-                    parent_location = Rect(parent_obj.location.left, parent_obj.location.top,
-                                          width=parent_obj.location.width, height=parent_obj.location.height)
-                except (AttributeError, TypeError):
-                    # Parent location doesn't have expected attributes
-                    parent_location = None
-                
-                if parent_location:
-                    parent_name = parent_obj.name if hasattr(parent_obj, 'name') else None
-                    parent_role = parent_obj.role if hasattr(parent_obj, 'role') else None
-                    
-                    # Find matching parent in label map (must be same window)
-                    for candidate_label, candidate_data in self.label_map.items():
-                        if candidate_data['hwnd'] != obj_hwnd:
-                            continue  # Different window
-                        candidate_obj_info = candidate_data['obj_info']
-                        if (candidate_obj_info.get('name') == parent_name and
-                            candidate_obj_info.get('role') == parent_role and
-                            candidate_data['location'] == parent_location):
-                            found_parent_label = candidate_label
-                            break
+        # Find smallest existing node that contains this node (same window)
+        smallest_parent = None
+        smallest_area = float('inf')
         
-        # Fallback: find smallest existing object that contains this object (same window)
-        if found_parent_label is None and location_rect:
-            smallest_containing_area = float('inf')
+        for candidate_label, candidate_node in self.label_map.items():
+            if candidate_node.hwnd != node.hwnd:
+                continue  # Different window
             
-            for candidate_label, candidate_data in self.label_map.items():
-                if candidate_data['hwnd'] != obj_hwnd:
-                    continue  # Different window
-                candidate_location = candidate_data['location']
-                if candidate_location and candidate_location.contains(location_rect):
-                    container_area = candidate_location.area()
-                    if container_area < smallest_containing_area:
-                        smallest_containing_area = container_area
-                        found_parent_label = candidate_label
+            # Skip self
+            if candidate_node.label == node.label:
+                continue
+            
+            # Check if candidate contains this node
+            if candidate_node.contains(node):
+                candidate_area = candidate_node.location.area()
+                if candidate_area < smallest_area:
+                    smallest_area = candidate_area
+                    smallest_parent = candidate_node
         
-        return found_parent_label
+        return smallest_parent
+    
+    def _find_children_nodes(self, node):
+        """Find any existing nodes that should be children of this node.
+        
+        Looks for nodes in the same window that are spatially contained by this node.
+        Only considers nodes at their current depth level (not already assigned as deep descendants).
+        
+        Args:
+            node: TreeNode to find children for
+            
+        Returns:
+            list: List of TreeNode objects that should be children
+        """
+        if not node.location:
+            return []
+        
+        children = []
+        
+        for candidate_label, candidate_node in self.label_map.items():
+            if candidate_node.hwnd != node.hwnd:
+                continue  # Different window
+            
+            # Skip self
+            if candidate_node.label == node.label:
+                continue
+            
+            # Skip if candidate is already our ancestor (would create cycle)
+            current = node.parent
+            while current:
+                if current.label == candidate_node.label:
+                    break  # Candidate is our ancestor, skip
+                current = current.parent
+            else:
+                # Check if this node contains the candidate
+                if node.contains(candidate_node):
+                    children.append(candidate_node)
+        
+        return children
     
     def _calculate_depth_from_tree(self, obj, obj_hwnd):
         """Calculate depth level by traversing NVDA tree to window.
@@ -1063,30 +1539,25 @@ class ObjectLayer(RenderLayer):
         if existing_label > 0:
             return existing_label
         
-        # Find parent label in existing labels
-        found_parent_label = self._find_parent_in_label_map(obj, obj_hwnd, location_rect)
+        # Check if this object is actually a window (not just by role, but by bounds matching)
+        obj_role = obj_info.get('role')
+        obj_name = obj_info.get('name', 'Unknown')
+        is_window = self._is_actually_window(obj, obj_info, obj_hwnd, location_rect)
         
-        # Calculate depth level based on parent or NVDA tree traversal
-        if found_parent_label is not None:
-            # Parent exists in our label map - depth level is one level deeper
-            parent_depth_level = self.label_map[found_parent_label]['depth']
-            object_depth_level = parent_depth_level + 1
+        # Windows are always depth 0
+        if is_window:
+            object_depth_level = 0
         else:
-            # No parent in label map - traverse NVDA tree to calculate depth level from window
-            tree_depth_count, window_obj = self._calculate_depth_from_tree(obj, obj_hwnd)
+            # For non-window objects, ensure the window has a label at depth 0
+            window_label = self._get_or_create_window_label(obj_hwnd, window_obj=None)
+            if window_label == 0:
+                logMessage(f"[ObjectLayer] add_label: Failed to create window label for hwnd {obj_hwnd}")
+                return 0
             
-            # Ensure window label exists at depth 0
-            if tree_depth_count > 0 or window_obj is not None:
-                # Create window label if it doesn't exist
-                window_label = self._get_or_create_window_label(obj_hwnd, window_obj)
-                if window_label == 0:
-                    logMessage(f"[ObjectLayer] add_label: Failed to create window label for hwnd {obj_hwnd}")
-                    return 0
-            
-            # Depth level is distance from window (depth 0 = window, depth 1 = direct children, etc.)
-            object_depth_level = tree_depth_count
+            # Default to depth 1 - tree insertion will find parent and update depth if needed
+            object_depth_level = 1
         
-        # Allocate label from the depth level's range
+        # Allocate label from the depth range
         allocated_label = self._calculate_label_for_depth(object_depth_level)
         
         # Verify label is valid
@@ -1094,19 +1565,75 @@ class ObjectLayer(RenderLayer):
             logMessage(f"[ObjectLayer] add_label: Failed to allocate label for depth level {object_depth_level}")
             return 0
         
-        # Store object data with allocated label
-        self.label_map[allocated_label] = {
-            'obj_info': obj_info,
-            'location': location_rect,
-            'depth': object_depth_level,
-            'hwnd': obj_hwnd,
-            'mesh_point': mesh_point  # Store mesh point where object was detected
-        }
+        # FINAL SAFETY CHECK: Verify non-windows are not getting depth-0 labels
+        if not is_window and allocated_label <= 50:  # Depth 0 labels are 1-50
+            logMessage(f"[ObjectLayer] ERROR: Non-window '{obj_name[:30]}' (role={obj_role}) got depth-0 label {allocated_label}! Forcing to depth 1.")
+            # Force recalculation for depth 1
+            allocated_label = self._calculate_label_for_depth(1)
+            object_depth_level = 1
+            if allocated_label == 0:
+                logMessage(f"[ObjectLayer] add_label: Failed to allocate depth-1 label")
+                return 0
+        
+        # Verify label is valid
+        if allocated_label == 0:
+            logMessage(f"[ObjectLayer] add_label: Failed to allocate label for depth level {object_depth_level}")
+            return 0
+        
+        # Create TreeNode and insert into tree structure
+        # The tree insertion will handle finding parent/children and updating depths
+        new_node = TreeNode(
+            label=allocated_label,
+            obj_info=obj_info,
+            location=location_rect,
+            depth=object_depth_level,
+            hwnd=obj_hwnd,
+            mesh_point=mesh_point
+        )
+        
+        # Insert node into tree - this will find parent or children and update depths recursively
+        self._insert_node_into_tree(new_node)
+        
+        # Update fast lookup arrays
+        if allocated_label < len(self.label_to_hwnd):
+            self.label_to_hwnd[allocated_label] = obj_hwnd
+            self.label_to_zorder[allocated_label] = self.window_z_orders.get(obj_hwnd, 999)
+        
+        # Add to emulator debug log
+        if self.plugin:
+            obj_name = obj_info.get('name', 'Unknown') or 'Unknown'
+            obj = obj_info.get('object')
+            obj_value = getattr(obj, 'value', 'N/A') if obj else 'N/A'
+            obj_value = str(obj_value) if obj_value else 'N/A'
+            role = obj_info.get('role')
+            
+            # Get human-readable role name
+            if role is not None:
+                try:
+                    role_str = controlTypes.Role(role).displayString
+                except:
+                    try:
+                        role_str = controlTypes.roleLabels.get(role, f"Unknown({role})")
+                    except:
+                        role_str = str(role)
+            else:
+                role_str = "Unknown"
+            
+            # Ensure role_str is a string
+            role_str = str(role_str) if role_str else "Unknown"
+            
+            # Convert location to bbox string
+            if location_rect and hasattr(location_rect, 'left'):
+                bbox = f"({location_rect.left}, {location_rect.top}, {location_rect.width}, {location_rect.height})"
+            else:
+                bbox = str(location_rect) if location_rect else "N/A"
+            
+            self.plugin.hardware.add_label_to_debug(allocated_label, obj_name, role_str, obj_value, bbox)
         
         return allocated_label
     
     def _get_depth_range(self, depth_level):
-        """Get the fixed (start_label, end_label) range for a depth level.
+        """Get the (start_label, end_label) range for a depth level.
         
         Args:
             depth_level: Depth level (0 = windows, 1 = direct children, 2+ = descendants)
@@ -1117,30 +1644,25 @@ class ObjectLayer(RenderLayer):
         if depth_level > self.max_depth:
             return None  # Depth level exceeds maximum
         
-        # Label ranges per depth level (configurable via software_config.json):
-        # With default labels_per_depth=50:
-        #   Depth level 0 (windows): labels 1-50
-        #   Depth level 1: labels 51-100
-        #   Depth level 2: labels 101-150
-        #   Depth level 3: labels 151-200
-        #   Depth level 4: labels 201-250
-        #   Depth level 5: labels 251-300
-        start_label = depth_level * self.labels_per_depth + 1
+        # Calculate range for this depth level
+        # Depth 0: 1 to labels_per_depth
+        # Depth 1: labels_per_depth+1 to 2*labels_per_depth
+        # etc.
+        start_label = (depth_level * self.labels_per_depth) + 1
         end_label = (depth_level + 1) * self.labels_per_depth
         
         return (start_label, end_label)
     
     def _calculate_label_for_depth(self, depth_level):
-        """Allocate label from fixed depth level range.
+        """Allocate label from depth level range.
         
-        Each depth level has a configurable range of labels (set in software_config.json).
-        With default settings (labels_per_depth=50):
-        - Depth level 0 (windows): labels 1-50
-        - Depth level 1 (direct children): labels 51-100
-        - Depth level 2: labels 101-150
-        - Depth level 3: labels 151-200
-        - Depth level 4: labels 201-250
-        - Depth level 5: labels 251-300
+        Global depth ranges shared by all windows:
+        - Depth level 0: 1 to labels_per_depth (windows)
+        - Depth level 1: labels_per_depth+1 to 2*labels_per_depth (direct children)
+        - etc.
+        
+        For example, with labels_per_depth=50 and max_depth=5:
+        D0=[1-50], D1=[51-100], D2=[101-150], D3=[151-200], D4=[201-250], D5=[251-300]
         
         Args:
             depth_level: The depth level for which to allocate a label (0 to max_depth)
@@ -1148,7 +1670,7 @@ class ObjectLayer(RenderLayer):
         Returns:
             int: Label for the new object, or 0 if allocation failed
         """
-        # Get fixed range for this depth level
+        # Get range for this depth level
         depth_range = self._get_depth_range(depth_level)
         if depth_range is None:
             logMessage(f"[ERROR] Depth level {depth_level} exceeds max_depth {self.max_depth}")
@@ -1160,7 +1682,7 @@ class ObjectLayer(RenderLayer):
         if depth_level not in self.depth_counters:
             self.depth_counters[depth_level] = start_label
         
-        # Get next available label from this depth level's range
+        # Get next available label from this depth level range
         label = self.depth_counters[depth_level]
         
         # Check if we've exhausted this depth level's range
@@ -1179,14 +1701,16 @@ class ObjectLayer(RenderLayer):
         """Get statistics about label allocation for debugging/monitoring.
         
         Returns:
-            dict: Statistics including fixed depth level ranges and current usage
+            dict: Statistics including global depth ranges and per-window usage
         """
         stats = {
             'max_depth': self.max_depth,
             'labels_per_depth': self.labels_per_depth,
-            'depth_levels': {}
+            'depth_levels': {},
+            'windows': {}
         }
         
+        # Global depth level statistics
         for depth_level in range(0, self.max_depth + 1):
             depth_range = self._get_depth_range(depth_level)
             if depth_range:
@@ -1194,15 +1718,26 @@ class ObjectLayer(RenderLayer):
                 current_counter = self.depth_counters.get(depth_level, start)
                 used_in_range = current_counter - start
                 available = end - current_counter + 1
-                count = sum(1 for data in self.label_map.values() if data['depth'] == depth_level)
+                
+                # Count actual objects at this depth
+                count = sum(1 for node in self.label_map.values() if node.depth == depth_level)
                 
                 stats['depth_levels'][depth_level] = {
-                    'fixed_range': (start, end),
+                    'range': (start, end),
                     'next_label': current_counter,
                     'allocated': used_in_range,
                     'available': available,
                     'active_objects': count
                 }
+        
+        # Per-window statistics
+        for hwnd, window_label in self.window_labels.items():
+            window_stats = {
+                'window_label': window_label,
+                'z_order': self.window_z_orders.get(hwnd, 999),
+                'total_objects': sum(1 for node in self.label_map.values() if node.hwnd == hwnd)
+            }
+            stats['windows'][hwnd] = window_stats
         
         return stats
     
@@ -1211,15 +1746,50 @@ class ObjectLayer(RenderLayer):
         if label not in self.label_map:
             return False
         
-        # Get depth level and hwnd before removing
-        label_depth = self.label_map[label]['depth']
-        label_hwnd = self.label_map[label]['hwnd']
+        # Remove from emulator debug log
+        if self.plugin:
+            self.plugin.hardware.remove_label_from_debug(label)
+        
+        # Get node before removing
+        node = self.label_map[label]
+        label_depth = node.depth
+        label_hwnd = node.hwnd
+        
+        # If this node has children, reassign them to this node's parent (or make them orphans)
+        if node.children:
+            for child in node.children[:]:  # Copy list to avoid modification during iteration
+                if node.parent:
+                    # Reassign child to this node's parent (grandparent)
+                    node.parent.add_child(child)
+                    # Update depth recursively (this will reallocate labels)
+                    child.update_depth_recursively(node.parent.depth + 1, self)
+                    logMessage(f"[ObjectLayer] Reassigned child {child.label} to grandparent {node.parent.label} after parent {label} removed")
+                else:
+                    # This node has no parent, so children become orphans (direct window children)
+                    child.parent = None
+                    # Set child depth to 1 (direct child of window, this will reallocate labels)
+                    child.update_depth_recursively(1, self)
+                    logMessage(f"[ObjectLayer] Shifted child {child.label} to depth 1 (orphan) after parent {label} removed")
+        
+        # Remove from parent's children list
+        if node.parent:
+            node.parent.remove_child(node)
+        
+        # If this was a window root, remove from window_roots
+        if label_depth == 0 and label_hwnd in self.window_roots:
+            if self.window_roots[label_hwnd].label == label:
+                del self.window_roots[label_hwnd]
         
         # Clear pixels for this node
         self.image[self.image == label] = 0
         
         # Remove from label map
         del self.label_map[label]
+        
+        # Clear from fast lookup arrays
+        if label < len(self.label_to_hwnd):
+            self.label_to_hwnd[label] = 0
+            self.label_to_zorder[label] = 999
         
         # If this was a window label (depth 0), remove from window tracking
         if label_depth == 0 and label_hwnd in self.window_labels:
@@ -1232,12 +1802,16 @@ class ObjectLayer(RenderLayer):
             # If this freed label is less than the current counter, reset to reuse it
             if label < self.depth_counters[label_depth]:
                 self.depth_counters[label_depth] = label
-                #logMessage(f"[ObjectLayer] Recycled label {label} at depth {label_depth}, reset counter")
+                    #logMessage(f"[ObjectLayer] Recycled label {label} at depth {label_depth} for window {label_hwnd}, reset counter")
         
         return True
     
     def fill_object_region(self, label, location, region):
-        """Fill object region with label, respecting depth ordering.
+        """Fill object region with label using efficient vectorized z-order priority.
+        
+        Priority order:
+        1. Windows in front (lower z-order) always overwrite windows behind (higher z-order)
+        2. Within same window: Higher labels (deeper) overwrite lower labels (shallower)
         
         Args:
             label: The object label to write
@@ -1257,11 +1831,56 @@ class ObjectLayer(RenderLayer):
         image_rect = Rect(0, 0, img_width, img_height)
         obj_clamped = obj.intersection(image_rect)
                 
-        # Fill object region with label - only overwrite lower labels (shallower depth)
-        # This ensures children (higher labels) are not overwritten by parents
+        # Fill object region with efficient vectorized z-order comparison
         if obj_clamped and obj_clamped.width > 0 and obj_clamped.height > 0:
             x1, y1, x2, y2 = obj_clamped.left, obj_clamped.top, obj_clamped.right, obj_clamped.bottom
             region_slice = self.image[y1:y2, x1:x2]
-            # Only write where current label is lower (shallower depth) than new label
-            self.image[y1:y2, x1:x2] = np.where(region_slice < label, label, region_slice)
+            
+            # Get current label's window and z-order from fast lookup
+            if label >= len(self.label_to_hwnd):
+                logMessage(f"[ObjectLayer] fill_object_region: label {label} out of bounds")
+                return
+            current_hwnd = self.label_to_hwnd[label]
+            current_z_order = self.label_to_zorder[label]
+            
+            # Verify label is valid
+            if current_hwnd == 0:
+                # Label not in lookup array - this shouldn't happen, but handle gracefully
+                label_data = self.label_map.get(label)
+                if not label_data:
+                    logMessage(f"[ObjectLayer] fill_object_region: label {label} not found in label_map")
+                    return
+                # Log for debugging
+                logMessage(f"[ObjectLayer] fill_object_region: label {label} has hwnd=0 in lookup, recovering from label_map")
+                current_hwnd = label_data.hwnd
+                current_z_order = self.window_z_orders.get(current_hwnd, 999)
+            
+            # Vectorized lookup: get hwnd and z-order for all existing labels in region
+            existing_hwnds = self.label_to_hwnd[region_slice]
+            existing_z_orders = self.label_to_zorder[region_slice]
+            
+            # Build overwrite mask using vectorized operations
+            # Always overwrite background (label 0)
+            overwrite_mask = (region_slice == 0)
+            
+            # Same window: higher label overwrites lower
+            same_window = (existing_hwnds == current_hwnd) & (region_slice > 0)
+            overwrite_mask |= same_window & (region_slice < label)
+            
+            # Different window: check z-order if available, otherwise use label comparison
+            different_window = (existing_hwnds != current_hwnd) & (region_slice > 0)
+            
+            # Only use z-order when both windows have valid z-orders (< 999)
+            both_have_valid_z_order = (current_z_order < 999) & (existing_z_orders < 999)
+            z_order_condition = different_window & both_have_valid_z_order & (current_z_order < existing_z_orders)
+            
+            # For windows without valid z-orders, fall back to label comparison
+            # (higher label overwrites lower, similar to depth-based ordering)
+            no_valid_z_order = different_window & ~both_have_valid_z_order
+            label_fallback_condition = no_valid_z_order & (region_slice < label)
+            
+            overwrite_mask |= z_order_condition | label_fallback_condition
+            
+            # Apply the overwrite mask
+            self.image[y1:y2, x1:x2] = np.where(overwrite_mask, label, region_slice)
         

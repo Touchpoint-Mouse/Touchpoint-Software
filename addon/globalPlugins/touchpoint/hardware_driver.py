@@ -131,7 +131,7 @@ class HardwareDriver:
             self.plugin.emulator_gui.set_vibration(amplitude, frequency, duration)
     
     def send_debug_log(self, message):
-        """Send debug message to emulator GUI.
+        """Send debug message to emulator GUI (legacy method).
         
         Args:
             message: Debug message string
@@ -139,6 +139,28 @@ class HardwareDriver:
         # Update emulator GUI
         if self.plugin.emulator_gui:
             self.plugin.emulator_gui.log_debug(message)
+    
+    def add_label_to_debug(self, label, name, role, value, bbox):
+        """Add or update a label in the emulator debug log.
+        
+        Args:
+            label: Label number
+            name: Object name
+            role: Object role string
+            value: Object value
+            bbox: Bounding box string
+        """
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.add_label_to_log(label, name, role, value, bbox)
+    
+    def remove_label_from_debug(self, label):
+        """Remove a label from the emulator debug log.
+        
+        Args:
+            label: Label number to remove
+        """
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.remove_label_from_log(label)
             
     def set_max_elevation_speed(self, speed):
         """Set the maximum elevation speed for the device."""
