@@ -50,8 +50,13 @@ class RenderPipeline:
         """Create render layers with computed dimensions from config."""
         layer_dims = self.config.layer_dimensions
         
+        # Get depth label allocation config
+        depth_config = self.config.software.get('depth_label_allocation', {})
+        max_depth = depth_config.get('max_depth', 5)
+        labels_per_depth = depth_config.get('labels_per_depth', 50)
+        
         self.capture_layer = RenderLayer(id="capture", dtype=np.uint8, num_channels=3)  # BGR color
-        self.object_layer = ObjectLayer(id="object")  # Dynamic size follows capture region
+        self.object_layer = ObjectLayer(id="object", max_depth=max_depth, labels_per_depth=labels_per_depth)  # Dynamic size follows capture region
         self.depth_layer = RenderLayer(id="depth", dtype=np.uint8, constant_size=layer_dims['depth'], num_channels=1)  # Grayscale
         self.texture_layer = RenderLayer(id="texture", dtype=np.uint8, constant_size=layer_dims['texture'])  # BGR color
         

@@ -129,6 +129,16 @@ class HardwareDriver:
         # Update emulator GUI
         if self.plugin.emulator_gui:
             self.plugin.emulator_gui.set_vibration(amplitude, frequency, duration)
+    
+    def send_debug_log(self, message):
+        """Send debug message to emulator GUI.
+        
+        Args:
+            message: Debug message string
+        """
+        # Update emulator GUI
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.log_debug(message)
             
     def set_max_elevation_speed(self, speed):
         """Set the maximum elevation speed for the device."""

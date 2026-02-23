@@ -98,7 +98,7 @@ class TouchpointEmulatorGUI:
         """Create the wx window."""
         try:
             self.frame = wx.Frame(None, title="Touchpoint Hardware Emulator", 
-                                 size=(800, 900), style=wx.DEFAULT_FRAME_STYLE & ~wx.RESIZE_BORDER)
+                                 size=(800, 1200), style=wx.DEFAULT_FRAME_STYLE & ~wx.RESIZE_BORDER)
             
             self.is_open = True
             self.last_update_time = time.time()
@@ -224,6 +224,19 @@ class TouchpointEmulatorGUI:
         
         main_sizer.Add(vibration_sizer, 1, wx.ALL | wx.EXPAND, 10)
         
+        # Debug Log Section
+        debug_box = wx.StaticBox(panel, label="Debug Log")
+        debug_sizer = wx.StaticBoxSizer(debug_box, wx.VERTICAL)
+        
+        self.debug_log = wx.TextCtrl(panel, size=(560, 200), 
+                                        style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_WORDWRAP)
+        self.debug_log.SetFont(mono_font)
+        self.debug_log.SetBackgroundColour(wx.Colour(245, 245, 245))
+        self.debug_log.SetForegroundColour(wx.Colour(51, 51, 51))
+        debug_sizer.Add(self.debug_log, 1, wx.ALL | wx.EXPAND, 5)
+        
+        main_sizer.Add(debug_sizer, 1, wx.ALL | wx.EXPAND, 10)
+        
         panel.SetSizer(main_sizer)
     
     def set_hardware_status(self, connected):
@@ -272,6 +285,16 @@ class TouchpointEmulatorGUI:
         if self.is_open and self.frame:
             wx.CallAfter(self._add_vibration_log, amplitude, frequency, duration)
     
+    def log_debug(self, message):
+        """Add debug message to log.
+        
+        Args:
+            message: Debug message string
+        """
+        # Add to debug log if window is open
+        if self.is_open and self.frame:
+            wx.CallAfter(self._add_debug_log, message)
+    
     def update_layer_image(self, layer_id, image):
         """Update a layer's image data.
         
@@ -313,6 +336,30 @@ class TouchpointEmulatorGUI:
             self.vibration_log.SetInsertionPointEnd()
         except Exception as e:
             logMessage(f"[ERROR] Failed to add vibration log: {e}")
+    
+    def _add_debug_log(self, message):
+        """Add debug message to log."""
+        try:
+            current_time = time.time()
+            timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
+            milliseconds = int((current_time % 1) * 1000)
+            timestamp_with_ms = f"{timestamp}.{milliseconds:03d}"
+            
+            log_entry = f"[{timestamp_with_ms}] {message}\n"
+            
+            self.debug_log.AppendText(log_entry)
+            
+            # Limit log to last 100 lines
+            line_count = self.debug_log.GetNumberOfLines()
+            if line_count > 100:
+                # Remove first line
+                first_line_end = self.debug_log.XYToPosition(0, 1)
+                self.debug_log.Remove(0, first_line_end)
+            
+            # Scroll to the end to show the latest entry
+            self.debug_log.SetInsertionPointEnd()
+        except Exception as e:
+            logMessage(f"[ERROR] Failed to add debug log: {e}")
     
     def _update_connection_status(self):
         """Update the connection status labels."""

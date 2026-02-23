@@ -2,7 +2,7 @@ import math
 import threading
 import controlTypes
 from .dependencies import np, cv2
-from .utils import Rect, logMessage, is_window_occluded, get_rect_mask, get_object_window_handle, get_window_z_order
+from .utils import Rect, logMessage, is_window_occluded, get_actual_border_mask, get_object_window_handle, get_window_z_order
 import time
 import traceback
 from collections import namedtuple
@@ -167,6 +167,234 @@ class ObjectRenderer(Renderer):
         """
         self.capture_layer = capture_layer
         self.object_layer = object_layer
+    
+    def _invalidate_and_collect_existing_objects(self, region, prev_region, overlap_region, diff_mask):
+        """Invalidate stale objects and collect remaining valid ones.
+        
+        Args:
+            region: Current capture region
+            prev_region: Previous capture region
+            overlap_region: Intersection of current and previous regions
+            diff_mask: Boolean mask of changed pixels
+            
+        Returns:
+            tuple: (objects_needing_redraw, objects_fully_in_overlap) as lists of (label, location) tuples
+        """
+        objects_needing_redraw = []
+        objects_fully_in_overlap = []
+        labels_removed = 0
+        
+        for label, label_data in list(self.object_layer.label_map.items()):
+            location = label_data['location']
+            hwnd = label_data['hwnd']
+            
+            if location is None:
+                continue
+            
+            # Check if this object is completely occluded by windows in front
+            if is_window_occluded(hwnd, location):
+                self.object_layer.remove_label(label)
+                labels_removed += 1
+                #logMessage(f"[ObjectRenderer] Removed occluded label {label} from window {hwnd}")
+                continue
+            
+            # Check if object is within current capture region
+            if not location.intersects(region):
+                # Object completely outside current region - remove it
+                self.object_layer.remove_label(label)
+                labels_removed += 1
+                #logMessage(f"[ObjectRenderer] Removed out-of-bounds label {label}")
+                continue
+            
+            # Only check for invalidation if object intersects the overlap region
+            # Objects entirely in new regions (no overlap) should not be invalidated
+            if overlap_region and location.intersects(overlap_region):
+                # Convert object's FULL location to current image local coordinates
+                obj_rect_local = location.global_to_local(region.top_left())
+                
+                # Get border mask for the FULL object using actual borders (not clamped)
+                # This avoids creating artificial borders when object extends beyond capture region
+                object_border_mask = get_actual_border_mask(obj_rect_local, diff_mask.shape)
+                
+                # Convert overlap region to local coordinates to create a mask
+                overlap_local = overlap_region.global_to_local(region.top_left())
+                
+                # Create mask for overlap region
+                overlap_mask = np.zeros(diff_mask.shape, dtype=bool)
+                overlap_clamped = overlap_local.intersection(Rect(0, 0, diff_mask.shape[1], diff_mask.shape[0]))
+                if overlap_clamped and overlap_clamped.width > 0 and overlap_clamped.height > 0:
+                    overlap_mask[overlap_clamped.top:overlap_clamped.bottom, 
+                                overlap_clamped.left:overlap_clamped.right] = True
+                
+                # Only check border pixels that are within the overlap region
+                border_in_overlap = object_border_mask & overlap_mask
+                border_changed = np.any(diff_mask[border_in_overlap])
+                
+                if border_changed:
+                    # Before invalidating, try to reacquire object from its mesh point
+                    mesh_point = label_data.get('mesh_point')
+                    should_invalidate = True
+                    
+                    if mesh_point is not None:
+                        try:
+                            mesh_x, mesh_y = mesh_point
+                            # Reacquire object from the same mesh point
+                            reacquired_obj = NVDAObjects.NVDAObject.objectFromPoint(int(mesh_x), int(mesh_y))
+                            
+                            if reacquired_obj and hasattr(reacquired_obj, 'location') and reacquired_obj.location:
+                                # Create obj_info for reacquired object
+                                reacquired_obj_info = {
+                                    'name': reacquired_obj.name if hasattr(reacquired_obj, 'name') else 'Unknown',
+                                    'role': reacquired_obj.role if hasattr(reacquired_obj, 'role') else None,
+                                    'location': reacquired_obj.location,
+                                    'object': reacquired_obj
+                                }
+                                
+                                # Use existing duplicate checking logic
+                                reacquired_obj_nvda, reacquired_hwnd, reacquired_location = \
+                                    self.object_layer._validate_and_extract_object(reacquired_obj_info)
+                                
+                                if reacquired_obj_nvda and reacquired_hwnd and reacquired_location:
+                                    # Check if reacquired object is a duplicate of the existing label
+                                    duplicate_label = self.object_layer._check_duplicate_object(
+                                        reacquired_obj_info, reacquired_hwnd, reacquired_location
+                                    )
+                                    
+                                    if duplicate_label == label:
+                                        # Same object still at the same location - don't invalidate
+                                        should_invalidate = False
+                                        debug_msg = f"Reacquired label {label} from mesh point {mesh_point} - border changed but object unchanged"
+                                        self.plugin.hardware.send_debug_log(debug_msg)
+                        except Exception as e:
+                            # If reacquisition fails, proceed with invalidation
+                            pass
+                    
+                    if should_invalidate:
+                        # Border pixels changed - invalidate this object
+                        self.object_layer.remove_label(label)
+                        labels_removed += 1
+                        #logMessage(f"[ObjectRenderer] Removed invalidated label {label} (border changed)")
+                        # Log object name, role, and value to debug log
+                        obj_info = label_data.get('obj_info', {})
+                        obj = obj_info.get('object')
+                        obj_value = getattr(obj, 'value', 'N/A') if obj else 'N/A'
+                        debug_msg = f"Invalidated label {label} (name: {obj_info.get('name', 'Unknown')}, role: {obj_info.get('role', 'Unknown')}, value: {obj_value}), location: {location}"
+                        self.plugin.hardware.send_debug_log(debug_msg)
+                        continue
+            
+            # Object not invalidated - determine if it needs redrawing
+            # Objects fully inside overlap region can keep their pixels
+            # Objects extending outside overlap need redrawing for new visible areas
+            if overlap_region and overlap_region.contains(location):
+                # Object fully inside overlap region - pixels are still valid
+                objects_fully_in_overlap.append((label, location))
+            else:
+                # Object extends outside overlap or overlap is None - needs redrawing
+                objects_needing_redraw.append((label, location))
+        
+        return objects_needing_redraw, objects_fully_in_overlap
+    
+    def _detect_object_at_point(self, x, y, region, mesh_width, mesh_height, current_object_image):
+        """Detect and validate NVDA object at a specific screen point.
+        
+        Args:
+            x, y: Screen coordinates to check
+            region: Current capture region
+            mesh_width, mesh_height: Mesh grid dimensions
+            current_object_image: Current object layer image
+            
+        Returns:
+            tuple: (obj_info dict, label) if valid object detected, (None, 0) otherwise
+        """
+        # Continue if this point already has a label in the working image (skip to next point)
+        y_rel = y - region.top
+        x_rel = x - region.left
+        
+        pixel_value = current_object_image[y_rel, x_rel]
+        if pixel_value != 0:
+            return None, 0
+        
+        try:
+            # Get NVDA object at this screen position
+            obj = NVDAObjects.NVDAObject.objectFromPoint(int(x), int(y))
+            
+            # Skip if no object or object has no location (can't label it)
+            if obj is None:
+                return None, 0
+            
+            if not hasattr(obj, 'location') or obj.location is None:
+                return None, 0
+            
+            # Skip if any of the object's dimensions are smaller than the mesh grid cell size
+            cell_width = region.width / mesh_width
+            cell_height = region.height / mesh_height
+            
+            try:
+                obj_width = obj.location.width
+                obj_height = obj.location.height
+            except (AttributeError, TypeError):
+                # Location object doesn't have width/height attributes
+                return None, 0
+            
+            if obj_width < cell_width or obj_height < cell_height:
+                return None, 0
+            
+            # Create obj_info dictionary (must include 'object' for internal processing)
+            obj_info = {
+                'name': obj.name if hasattr(obj, 'name') else 'Unknown',
+                'role': obj.role if hasattr(obj, 'role') else None,
+                'location': obj.location,
+                'object': obj
+            }
+            
+            # Add to object layer (handles parent finding and depth calculation internally)
+            # Pass mesh point where this object was detected
+            new_label = self.object_layer.add_label(obj_info, mesh_point=(x, y))
+            
+            return obj_info, new_label
+            
+        except Exception as e:
+            return None, 0
+    
+    def _perform_mesh_grid_scan(self, region, mesh_width, mesh_height, current_object_image):
+        """Perform mesh grid scan to detect new objects.
+        
+        Args:
+            region: Current capture region
+            mesh_width, mesh_height: Mesh grid dimensions
+            current_object_image: Current object layer image
+            
+        Returns:
+            list: List of (label, location) tuples for newly detected objects
+        """
+        # Generate evenly spaced points across the capture region including edges
+        # linspace includes both endpoints, so edges are covered
+        x_points = np.linspace(region.left, region.left + region.width - 1, mesh_width, dtype=int)
+        y_points = np.linspace(region.top, region.top + region.height - 1, mesh_height, dtype=int)
+        
+        # Collect new detections during mesh scan
+        new_detections = []
+        
+        # Gets screen bounds for occlusion checking during mesh scan
+        screen_width, screen_height = self.plugin.get_screen_size()
+        
+        # Loop through mesh grid and detect unique objects
+        for y in y_points:
+            for x in x_points:
+                # Checks to ensure global coordinates are within screen bounds
+                if y < 0 or y >= screen_height or x < 0 or x >= screen_width:
+                    continue
+                
+                obj_info, new_label = self._detect_object_at_point(
+                    x, y, region, mesh_width, mesh_height, current_object_image
+                )
+                
+                if new_label > 0:
+                    # Use location from label_map (converted to Rect) instead of raw NVDA location
+                    stored_location = self.object_layer.label_map.get(new_label, {}).get('location')
+                    new_detections.append((new_label, stored_location))
+        
+        return new_detections
         
     def __call__(self):
         """Find unique NVDA objects using a mesh grid and update the semantic map"""
@@ -181,6 +409,9 @@ class ObjectRenderer(Renderer):
             region = self.capture_layer.current_region
             prev_region = self.capture_layer.prev_region
             
+            # Calculate the overlap region between previous and current capture regions
+            overlap_region = prev_region.intersection(region)
+            
             # Get object mesh dimensions from config
             if not self.plugin or not hasattr(self.plugin, 'config'):
                 logMessage("[ObjectRenderer] No plugin or config available")
@@ -193,135 +424,24 @@ class ObjectRenderer(Renderer):
                 
             mesh_width, mesh_height = mesh_dims
             
-            # Invalidate objects whose border pixels have changed
-            current_object_image = self.object_layer.get_image()
-            labels_removed = 0
+            # Invalidate stale objects and separate into those needing redraw vs those fully in overlap
+            objects_needing_redraw, objects_fully_in_overlap = self._invalidate_and_collect_existing_objects(
+                region, prev_region, overlap_region, diff_mask
+            )
             
-            # Collect redraw actions during invalidation to execute after mesh grid scan
-            # This prevents redraws from filling pixels and blocking mesh grid detection
-            redraw_actions = []
-            
-            # Iterate over all labels to check for invalidation
-            for label, label_data in list(self.object_layer.label_map.items()):
-                location = label_data['location']
-                hwnd = label_data['hwnd']
-                
-                if location is None:
-                    continue
-                
-                # Check if this object is completely occluded by windows in front
-                if is_window_occluded(hwnd, location):
-                    self.object_layer.remove_label(label)
-                    labels_removed += 1
-                    logMessage(f"[ObjectRenderer] Removed occluded label {label} from window {hwnd}")
-                    continue
-                
-                # Clamp to overlap of previous and current capture regions to avoid invalid diff mask areas
-                obj_rect = location.intersection(prev_region.intersection(region))
-                
-                # If no intersection, object is completely outside bounds - remove it
-                if not obj_rect or obj_rect.width <= 0 or obj_rect.height <= 0:
-                    self.object_layer.remove_label(label)
-                    labels_removed += 1
-                    logMessage(f"[ObjectRenderer] Removed out-of-bounds label {label}")
-                    continue
-                
-                # Convert object location to capture-layer-relative coordinates
-                obj_rect = obj_rect.global_to_local(region.top_left())
-                
-                # Check only border pixels for changes (more efficient)
-                border_mask = get_rect_mask(obj_rect, diff_mask.shape)
-                border_changed = np.any(diff_mask[border_mask])
-                
-                if border_changed:
-                    # Border pixels changed - invalidate this object only
-                    self.object_layer.remove_label(label)
-                    labels_removed += 1
-                    logMessage(f"[ObjectRenderer] Removed invalidated label {label} (border changed)")
-                else:
-                    # Object not invalidated - queue redraw to update visible bounding box
-                    redraw_actions.append((label, location))
-            
-            # Get fresh object image after invalidation for mesh grid detection
-            # This ensures mesh grid can detect objects where labels were just removed
+            # Get current object image for mesh grid detection
+            # Objects fully in overlap have valid pixels, so we don't need to clear everything
             current_object_image = self.object_layer.get_image()
             
-            # Create mesh grid for object detection
-            # Generate evenly spaced points across the capture region including edges
-            # linspace includes both endpoints, so edges are covered
-            x_points = np.linspace(region.left, region.left + region.width - 1, mesh_width, dtype=int)
-            y_points = np.linspace(region.top, region.top + region.height - 1, mesh_height, dtype=int)
+            # Perform mesh grid scan to detect new objects
+            new_detections = self._perform_mesh_grid_scan(
+                region, mesh_width, mesh_height, current_object_image
+            )
             
-            # Collect drawing actions during mesh scan to execute at the end
-            # This prevents large parent objects from overwriting children during the scan
-            
-            # Gets screen bounds for occlusion checking during mesh scan
-            screen_width, screen_height = self.plugin.get_screen_size()
-            
-            # Loop through mesh grid and detect unique objects
-            for y in y_points:
-                for x in x_points:
-                    # Checks to ensure global coordinates are within screen bounds
-                    if y < 0 or y >= screen_height or x < 0 or x >= screen_width:
-                        continue
-                    
-                    # Continue if this point already has a label in the working image (skip to next point)
-                    y_rel = y - region.top
-                    x_rel = x - region.left
-                    
-                    pixel_value = current_object_image[y_rel, x_rel]
-                    if pixel_value != 0:
-                        continue
-                    
-                    try:
-                        # Get NVDA object at this screen position
-                        obj = NVDAObjects.NVDAObject.objectFromPoint(int(x), int(y))
-                        
-                        # Skip if no object or object has no location (can't label it)
-                        if obj is None:
-                            continue
-                        
-                        if not hasattr(obj, 'location') or obj.location is None:
-                            continue
-                        
-                        # Skip if any of the object's dimensions are smaller than the mesh grid cell size
-                        cell_width = region.width / mesh_width
-                        cell_height = region.height / mesh_height
-                        if obj.location.width < cell_width or obj.location.height < cell_height:
-                            continue
-                        
-                        # Create obj_info dictionary (must include 'object' for internal processing)
-                        obj_info = {
-                            'name': obj.name if hasattr(obj, 'name') else 'Unknown',
-                            'role': obj.role if hasattr(obj, 'role') else None,
-                            'location': obj.location,
-                            'object': obj
-                        }
-                        
-                        # Add to object layer (handles parent finding and depth calculation internally)
-                        new_label = self.object_layer.add_label(obj_info)
-                        
-                        if new_label > 0:
-                            # Get role name and depth level for logging
-                            role_name = "Unknown"
-                            try:
-                                if 'role' in obj_info and obj_info['role'] is not None:
-                                    role_name = controlTypes.Role(obj_info['role']).name if hasattr(controlTypes, 'Role') else str(obj_info['role'])
-                            except:
-                                role_name = str(obj_info['role']) if 'role' in obj_info else "Unknown"
-                            
-                            depth_level = self.object_layer.label_map[new_label]['depth'] if new_label in self.object_layer.label_map else '?'
-                            logMessage(f"[ObjectRenderer] Detected object: label={new_label}, depth={depth_level}, name='{obj_info['name']}', role={role_name}, location=({obj_info['location'].left},{obj_info['location'].top},{obj_info['location'].width},{obj_info['location'].height})")
-                            
-                            # Queue drawing for later (after mesh scan completes)
-                            redraw_actions.append((new_label, obj_info['location']))
-                                
-                    except Exception as e:
-                        pass  # Silently skip exceptions at individual points
-            
-            # Execute all fill operations at once: redraws from invalidation + new detections
-            # This prevents early fills from blocking mesh grid detection
-            for label, location in redraw_actions:
+            # Bulk redraw: objects needing redraw + new detections
+            # (objects fully in overlap don't need redraw, their pixels are still valid)
+            all_objects_to_draw = objects_needing_redraw + new_detections
+            for label, location in all_objects_to_draw:
                 self.object_layer.fill_object_region(label, location, region)
                         
         except Exception as e:
@@ -682,8 +802,8 @@ class SemanticLayer(RenderLayer):
 class ObjectLayer(RenderLayer):
     """Render layer that stores object label information with depth-based allocation."""
     
-    def __init__(self, id, constant_size=None):
-        super().__init__(id, dtype=np.uint8, constant_size=constant_size, num_channels=1)
+    def __init__(self, id, constant_size=None, max_depth=5, labels_per_depth=50):
+        super().__init__(id, dtype=np.uint16, constant_size=constant_size, num_channels=1)
         # Flat dict mapping label -> object info with depth tracking
         self.label_map = {}  # label -> {'obj_info': dict, 'location': Rect, 'depth': int, 'hwnd': int}
         
@@ -691,9 +811,9 @@ class ObjectLayer(RenderLayer):
         self.window_z_orders = {}  # hwnd -> z-order position (0 = topmost)
         self.window_labels = {}  # hwnd -> window label (depth 0)
         
-        # Fixed depth-based label allocation
-        self.max_depth = 5  # Maximum supported depth levels (0-5)
-        self.labels_per_depth = 50  # Fixed allocation per depth level
+        # Configurable depth-based label allocation
+        self.max_depth = max_depth  # Maximum supported depth levels (configurable)
+        self.labels_per_depth = labels_per_depth  # Fixed allocation per depth level (configurable)
         self.depth_counters = {}  # depth_level -> next available label in that depth's range
         
     def _get_or_create_window_label(self, hwnd, window_obj=None):
@@ -752,21 +872,18 @@ class ObjectLayer(RenderLayer):
         }
         
         self.window_labels[hwnd] = window_label
-        logMessage(f"[ObjectLayer] Created window label {window_label} for hwnd {hwnd} at depth 0")
+        #logMessage(f"[ObjectLayer] Created window label {window_label} for hwnd {hwnd} at depth 0")
         
         return window_label
     
-    def add_label(self, obj_info):
-        """Add a new object label with depth-based allocation.
-        
-        Automatically finds parent in existing labels and calculates depth level.
-        If no parent found in labels, traverses NVDA tree to determine depth level.
-        Windows are automatically created at depth 0 when first child is detected.
+    def _validate_and_extract_object(self, obj_info):
+        """Validate object info and extract window handle and location.
         
         Args:
-            obj_info: Dictionary containing object information (name, role, location, 'object')
+            obj_info: Dictionary containing object information
+            
         Returns:
-            int: The label assigned to this object
+            tuple: (obj, obj_hwnd, location_rect) or (None, None, None) if invalid
         """
         from .utils import get_object_window_handle
         
@@ -774,30 +891,65 @@ class ObjectLayer(RenderLayer):
         obj = obj_info.get('object')
         if not obj:
             logMessage("[ObjectLayer] add_label: No object in obj_info")
-            return 0
+            return None, None, None
         
         obj_hwnd = get_object_window_handle(obj)
         if not obj_hwnd:
             logMessage("[ObjectLayer] add_label: No window handle for object")
-            return 0
+            return None, None, None
         
-        # Check for duplicates based on name, role, and location
+        # Extract and convert location
         obj_location = obj_info.get('location')
         if obj_location:
-            location_rect = Rect(obj_location.left, obj_location.top, 
-                               width=obj_location.width, height=obj_location.height)
-            for existing_label, existing_data in self.label_map.items():
-                if existing_data['hwnd'] != obj_hwnd:
-                    continue  # Different window
-                existing_obj_info = existing_data['obj_info']
-                if (existing_obj_info.get('name') == obj_info.get('name') and
-                    existing_obj_info.get('role') == obj_info.get('role') and
-                    existing_data['location'] == location_rect):
-                    return existing_label  # Already exists
+            try:
+                location_rect = Rect(obj_location.left, obj_location.top, 
+                                   width=obj_location.width, height=obj_location.height)
+            except (AttributeError, TypeError):
+                # location object doesn't have expected attributes
+                location_rect = None
         else:
             location_rect = None
         
-        # Find parent label in existing labels using NVDA tree and spatial containment
+        return obj, obj_hwnd, location_rect
+    
+    def _check_duplicate_object(self, obj_info, obj_hwnd, location_rect):
+        """Check if object already exists in label map.
+        
+        Args:
+            obj_info: Object information dictionary
+            obj_hwnd: Window handle
+            location_rect: Object location as Rect
+            
+        Returns:
+            int: Existing label if duplicate found, 0 otherwise
+        """
+        if location_rect is None:
+            return 0
+        
+        for existing_label, existing_data in self.label_map.items():
+            if existing_data['hwnd'] != obj_hwnd:
+                continue  # Different window
+            existing_obj_info = existing_data['obj_info']
+            if (existing_obj_info.get('name') == obj_info.get('name') and
+                existing_obj_info.get('role') == obj_info.get('role') and
+                existing_data['location'] == location_rect):
+                return existing_label  # Already exists
+        
+        return 0
+    
+    def _find_parent_in_label_map(self, obj, obj_hwnd, location_rect):
+        """Find parent object in existing label map.
+        
+        Tries NVDA parent property first, then falls back to spatial containment.
+        
+        Args:
+            obj: NVDA object
+            obj_hwnd: Window handle
+            location_rect: Object location as Rect
+            
+        Returns:
+            int: Parent label if found, None otherwise
+        """
         found_parent_label = None
         
         # First, try to use NVDA's parent property
@@ -805,21 +957,27 @@ class ObjectLayer(RenderLayer):
             parent_obj = obj.parent
             # Check if parent exists in our label map by matching name, role, location
             if hasattr(parent_obj, 'location') and parent_obj.location:
-                parent_location = Rect(parent_obj.location.left, parent_obj.location.top,
-                                      width=parent_obj.location.width, height=parent_obj.location.height)
-                parent_name = parent_obj.name if hasattr(parent_obj, 'name') else None
-                parent_role = parent_obj.role if hasattr(parent_obj, 'role') else None
+                try:
+                    parent_location = Rect(parent_obj.location.left, parent_obj.location.top,
+                                          width=parent_obj.location.width, height=parent_obj.location.height)
+                except (AttributeError, TypeError):
+                    # Parent location doesn't have expected attributes
+                    parent_location = None
                 
-                # Find matching parent in label map (must be same window)
-                for candidate_label, candidate_data in self.label_map.items():
-                    if candidate_data['hwnd'] != obj_hwnd:
-                        continue  # Different window
-                    candidate_obj_info = candidate_data['obj_info']
-                    if (candidate_obj_info.get('name') == parent_name and
-                        candidate_obj_info.get('role') == parent_role and
-                        candidate_data['location'] == parent_location):
-                        found_parent_label = candidate_label
-                        break
+                if parent_location:
+                    parent_name = parent_obj.name if hasattr(parent_obj, 'name') else None
+                    parent_role = parent_obj.role if hasattr(parent_obj, 'role') else None
+                    
+                    # Find matching parent in label map (must be same window)
+                    for candidate_label, candidate_data in self.label_map.items():
+                        if candidate_data['hwnd'] != obj_hwnd:
+                            continue  # Different window
+                        candidate_obj_info = candidate_data['obj_info']
+                        if (candidate_obj_info.get('name') == parent_name and
+                            candidate_obj_info.get('role') == parent_role and
+                            candidate_data['location'] == parent_location):
+                            found_parent_label = candidate_label
+                            break
         
         # Fallback: find smallest existing object that contains this object (same window)
         if found_parent_label is None and location_rect:
@@ -835,6 +993,79 @@ class ObjectLayer(RenderLayer):
                         smallest_containing_area = container_area
                         found_parent_label = candidate_label
         
+        return found_parent_label
+    
+    def _calculate_depth_from_tree(self, obj, obj_hwnd):
+        """Calculate depth level by traversing NVDA tree to window.
+        
+        Args:
+            obj: NVDA object
+            obj_hwnd: Window handle
+            
+        Returns:
+            tuple: (depth_level, window_obj) - depth from window and window object if found
+        """
+        current_obj = obj
+        tree_depth_count = 0
+        window_obj = None
+        
+        # Count steps from object to window through NVDA parent chain
+        while hasattr(current_obj, 'parent') and current_obj.parent:
+            tree_depth_count += 1
+            current_obj = current_obj.parent
+            
+            # Check if we've reached a window (has windowHandle and windowHandle matches itself)
+            if hasattr(current_obj, 'windowHandle') and current_obj.windowHandle:
+                # Verify this is actually the window object (not just a child with windowHandle)
+                current_hwnd = current_obj.windowHandle
+                if current_hwnd == obj_hwnd:
+                    # Found the window object
+                    window_obj = current_obj
+                    break
+            
+            # Prevent infinite loops
+            if tree_depth_count > 20:
+                logMessage("[ObjectLayer] add_label: NVDA tree traversal exceeded 20 levels, breaking")
+                break
+        
+        # Verify we reached a valid window object
+        if window_obj is None:
+            # Didn't find window in tree - this might be the window itself or orphaned object
+            # Check if current object IS the window
+            if hasattr(obj, 'windowHandle') and obj.windowHandle == obj_hwnd:
+                # This object is a window - check if no parent or parent is desktop
+                if not hasattr(obj, 'parent') or obj.parent is None:
+                    window_obj = obj
+                    tree_depth_count = 0  # Window itself is at depth 0
+        
+        return tree_depth_count, window_obj
+    
+    def add_label(self, obj_info, mesh_point=None):
+        """Add a new object label with depth-based allocation.
+        
+        Automatically finds parent in existing labels and calculates depth level.
+        If no parent found in labels, traverses NVDA tree to determine depth level.
+        Windows are automatically created at depth 0 when first child is detected.
+        
+        Args:
+            obj_info: Dictionary containing object information (name, role, location, 'object')
+            mesh_point: Optional tuple (x, y) of screen coordinates where object was detected
+        Returns:
+            int: The label assigned to this object
+        """
+        # Validate object and extract window handle and location
+        obj, obj_hwnd, location_rect = self._validate_and_extract_object(obj_info)
+        if obj is None:
+            return 0
+        
+        # Check for duplicates
+        existing_label = self._check_duplicate_object(obj_info, obj_hwnd, location_rect)
+        if existing_label > 0:
+            return existing_label
+        
+        # Find parent label in existing labels
+        found_parent_label = self._find_parent_in_label_map(obj, obj_hwnd, location_rect)
+        
         # Calculate depth level based on parent or NVDA tree traversal
         if found_parent_label is not None:
             # Parent exists in our label map - depth level is one level deeper
@@ -842,38 +1073,7 @@ class ObjectLayer(RenderLayer):
             object_depth_level = parent_depth_level + 1
         else:
             # No parent in label map - traverse NVDA tree to calculate depth level from window
-            current_obj = obj
-            tree_depth_count = 0
-            window_obj = None
-            
-            # Count steps from object to window through NVDA parent chain
-            while hasattr(current_obj, 'parent') and current_obj.parent:
-                tree_depth_count += 1
-                current_obj = current_obj.parent
-                
-                # Check if we've reached a window (has windowHandle and windowHandle matches itself)
-                if hasattr(current_obj, 'windowHandle') and current_obj.windowHandle:
-                    # Verify this is actually the window object (not just a child with windowHandle)
-                    current_hwnd = current_obj.windowHandle
-                    if current_hwnd == obj_hwnd:
-                        # Found the window object
-                        window_obj = current_obj
-                        break
-                
-                # Prevent infinite loops
-                if tree_depth_count > 20:
-                    logMessage("[ObjectLayer] add_label: NVDA tree traversal exceeded 20 levels, breaking")
-                    break
-            
-            # Verify we reached a valid window object
-            if window_obj is None:
-                # Didn't find window in tree - this might be the window itself or orphaned object
-                # Check if current object IS the window
-                if hasattr(obj, 'windowHandle') and obj.windowHandle == obj_hwnd:
-                    # This object is a window - check if no parent or parent is desktop
-                    if not hasattr(obj, 'parent') or obj.parent is None:
-                        window_obj = obj
-                        tree_depth_count = 0  # Window itself is at depth 0
+            tree_depth_count, window_obj = self._calculate_depth_from_tree(obj, obj_hwnd)
             
             # Ensure window label exists at depth 0
             if tree_depth_count > 0 or window_obj is not None:
@@ -899,7 +1099,8 @@ class ObjectLayer(RenderLayer):
             'obj_info': obj_info,
             'location': location_rect,
             'depth': object_depth_level,
-            'hwnd': obj_hwnd
+            'hwnd': obj_hwnd,
+            'mesh_point': mesh_point  # Store mesh point where object was detected
         }
         
         return allocated_label
@@ -916,13 +1117,14 @@ class ObjectLayer(RenderLayer):
         if depth_level > self.max_depth:
             return None  # Depth level exceeds maximum
         
-        # Fixed label ranges per depth level:
-        # Depth level 0 (windows): labels 1-50
-        # Depth level 1: labels 51-100
-        # Depth level 2: labels 101-150
-        # Depth level 3: labels 151-200
-        # Depth level 4: labels 201-250
-        # Depth level 5: labels 251-300
+        # Label ranges per depth level (configurable via software_config.json):
+        # With default labels_per_depth=50:
+        #   Depth level 0 (windows): labels 1-50
+        #   Depth level 1: labels 51-100
+        #   Depth level 2: labels 101-150
+        #   Depth level 3: labels 151-200
+        #   Depth level 4: labels 201-250
+        #   Depth level 5: labels 251-300
         start_label = depth_level * self.labels_per_depth + 1
         end_label = (depth_level + 1) * self.labels_per_depth
         
@@ -931,7 +1133,8 @@ class ObjectLayer(RenderLayer):
     def _calculate_label_for_depth(self, depth_level):
         """Allocate label from fixed depth level range.
         
-        Each depth level has a fixed range of labels:
+        Each depth level has a configurable range of labels (set in software_config.json).
+        With default settings (labels_per_depth=50):
         - Depth level 0 (windows): labels 1-50
         - Depth level 1 (direct children): labels 51-100
         - Depth level 2: labels 101-150
@@ -940,7 +1143,7 @@ class ObjectLayer(RenderLayer):
         - Depth level 5: labels 251-300
         
         Args:
-            depth_level: The depth level for which to allocate a label (0-5)
+            depth_level: The depth level for which to allocate a label (0 to max_depth)
         
         Returns:
             int: Label for the new object, or 0 if allocation failed
@@ -1022,14 +1225,14 @@ class ObjectLayer(RenderLayer):
         if label_depth == 0 and label_hwnd in self.window_labels:
             if self.window_labels[label_hwnd] == label:
                 del self.window_labels[label_hwnd]
-                logMessage(f"[ObjectLayer] Removed window label {label} for hwnd {label_hwnd}")
+                #logMessage(f"[ObjectLayer] Removed window label {label} for hwnd {label_hwnd}")
         
         # Recycle the label position by resetting depth counter if this label is earlier
         if label_depth in self.depth_counters:
             # If this freed label is less than the current counter, reset to reuse it
             if label < self.depth_counters[label_depth]:
                 self.depth_counters[label_depth] = label
-                logMessage(f"[ObjectLayer] Recycled label {label} at depth {label_depth}, reset counter")
+                #logMessage(f"[ObjectLayer] Recycled label {label} at depth {label_depth}, reset counter")
         
         return True
     
@@ -1041,6 +1244,10 @@ class ObjectLayer(RenderLayer):
             location: Object location (Rect, screen coordinates)
             region: Current capture region (Rect)
         """
+        # Skip if location is None
+        if location is None:
+            return
+        
         # Convert to capture-layer-relative coordinates
         obj = Rect(location.left - region.left, location.top - region.top, 
                    right=location.right - region.left, bottom=location.bottom - region.top)

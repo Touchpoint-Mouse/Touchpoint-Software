@@ -163,6 +163,19 @@ class Rect:
         
     def __repr__(self):
         return f"Rect({self.left}, {self.top}, {self.right}, {self.bottom})"
+    
+    def __eq__(self, other):
+        """Check if two rectangles are equal by comparing their coordinates."""
+        if not isinstance(other, Rect):
+            return False
+        return (self.left == other.left and
+                self.top == other.top and
+                self.right == other.right and
+                self.bottom == other.bottom)
+    
+    def __hash__(self):
+        """Make Rect hashable so it can be used in sets and as dict keys."""
+        return hash((self.left, self.top, self.right, self.bottom))
 
 def logMessage(message):
         """Log a message to the NVDA log.
@@ -401,35 +414,48 @@ def is_window_occluded(hwnd, obj_location=None):
         logMessage(f"Error checking window occlusion: {e}")
         return False
     
-def get_rect_mask(rect, image_shape):
-    """Generate a boolean mask for a given rectangle within an image shape.
+def get_actual_border_mask(rect, image_shape):
+    """Generate a boolean mask for only the actual borders of a rectangle that fall within image bounds.
+    
+    This does not create artificial borders when the rectangle extends beyond the image.
+    Only marks pixels that are on the rectangle's actual border lines.
     
     Args:
-        rect: Rect object defining the area to mask
+        rect: Rect object defining the area to mask (can extend beyond image bounds)
         image_shape: Tuple (height, width) of the image
     Returns:
-        np.ndarray: Boolean mask with True for pixels on the inside border of the rectangle and False elsewhere
+        np.ndarray: Boolean mask with True for pixels on the actual border that are visible
     """
     mask = np.zeros(image_shape, dtype=bool)
+    img_height, img_width = image_shape
     
-    # Ensure rectangle is within image bounds
-    clamped = rect.intersection(Rect(0, 0, image_shape[1], image_shape[0]))
+    # Check each border independently
+    # Left border (x = rect.left)
+    if 0 <= rect.left < img_width:
+        y_start = max(0, rect.top)
+        y_end = min(img_height, rect.bottom)
+        if y_start < y_end:
+            mask[y_start:y_end, rect.left] = True
     
-    # If clamped rect is empty, return the mask (all False)
-    if not clamped:
-        return mask
+    # Right border (x = rect.right - 1)
+    if 0 <= rect.right - 1 < img_width and rect.right > 0:
+        y_start = max(0, rect.top)
+        y_end = min(img_height, rect.bottom)
+        if y_start < y_end:
+            mask[y_start:y_end, rect.right - 1] = True
     
-    left = clamped.left
-    right = clamped.right
-    top = clamped.top
-    bottom = clamped.bottom
+    # Top border (y = rect.top)
+    if 0 <= rect.top < img_height:
+        x_start = max(0, rect.left)
+        x_end = min(img_width, rect.right)
+        if x_start < x_end:
+            mask[rect.top, x_start:x_end] = True
     
-    # Set the border pixels to True
-    if left < right and top < bottom:
-        mask[top:bottom, left] = True  # Left border
-        mask[top:bottom, right-1] = True  # Right border
-        mask[top, left:right] = True  # Top border
-        mask[bottom-1, left:right] = True  # Bottom border
+    # Bottom border (y = rect.bottom - 1)
+    if 0 <= rect.bottom - 1 < img_height and rect.bottom > 0:
+        x_start = max(0, rect.left)
+        x_end = min(img_width, rect.right)
+        if x_start < x_end:
+            mask[rect.bottom - 1, x_start:x_end] = True
     
-    return mask
-    
+    return mask    
