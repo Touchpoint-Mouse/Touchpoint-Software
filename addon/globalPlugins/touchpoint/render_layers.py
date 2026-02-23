@@ -210,10 +210,13 @@ class ObjectRenderer(Renderer):
                     logMessage(f"[ObjectRenderer] Z-order still 999 after update for hwnd {hwnd}, skipping occlusion check")
                     return False
             
-            # Check all tracked windows that are in front (lower z-order)
-            for other_hwnd, other_z_order in self.object_layer.window_z_orders.items():
+            # Check windows that are currently in the object tree and are in front (lower z-order)
+            for other_hwnd in self.object_layer.window_labels.keys():
                 if other_hwnd == hwnd:
                     continue
+                
+                # Get z-order for this window
+                other_z_order = self.object_layer.window_z_orders.get(other_hwnd, 999)
                 
                 # Only check windows in front (desktop/shell windows have z-order 9998)
                 # Skip windows with z-order >= 9998
@@ -1755,21 +1758,19 @@ class ObjectLayer(RenderLayer):
         label_depth = node.depth
         label_hwnd = node.hwnd
         
-        # If this node has children, reassign them to this node's parent (or make them orphans)
+        # If this node has children, reassign them to this node's parent but keep their current depth
         if node.children:
             for child in node.children[:]:  # Copy list to avoid modification during iteration
                 if node.parent:
                     # Reassign child to this node's parent (grandparent)
                     node.parent.add_child(child)
-                    # Update depth recursively (this will reallocate labels)
-                    child.update_depth_recursively(node.parent.depth + 1, self)
-                    logMessage(f"[ObjectLayer] Reassigned child {child.label} to grandparent {node.parent.label} after parent {label} removed")
+                    # Keep child at current depth (don't move down)
+                    logMessage(f"[ObjectLayer] Reassigned child {child.label} (depth {child.depth}) to grandparent {node.parent.label} after parent {label} removed")
                 else:
                     # This node has no parent, so children become orphans (direct window children)
                     child.parent = None
-                    # Set child depth to 1 (direct child of window, this will reallocate labels)
-                    child.update_depth_recursively(1, self)
-                    logMessage(f"[ObjectLayer] Shifted child {child.label} to depth 1 (orphan) after parent {label} removed")
+                    # Keep child at current depth (don't move to depth 1)
+                    logMessage(f"[ObjectLayer] Child {child.label} orphaned at depth {child.depth} after parent {label} removed")
         
         # Remove from parent's children list
         if node.parent:
