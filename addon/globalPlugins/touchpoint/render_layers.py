@@ -971,35 +971,7 @@ class ObjectLayer(RenderLayer):
         
         # Add to emulator debug log
         if self.plugin:
-            window_name = window_node.name
-            role = window_node.role
-            
-            # Get human-readable role name
-            if role is not None:
-                try:
-                    role_str = controlTypes.Role(role).displayString
-                except:
-                    try:
-                        role_str = controlTypes.roleLabels.get(role, f"Unknown({role})")
-                    except:
-                        role_str = str(role)
-            else:
-                role_str = "Window"
-            
-            # Ensure role_str is a string
-            role_str = str(role_str) if role_str else "Window"
-            
-            # Convert location to bbox string
-            if window_location and hasattr(window_location, 'left'):
-                bbox = f"({window_location.left}, {window_location.top}, {window_location.width}, {window_location.height})"
-            else:
-                bbox = "N/A"
-            
-            # Check if this is a desktop/shell window
-            if is_desktop_or_shell_window(hwnd):
-                logMessage(f"[ObjectLayer] Created desktop/shell window label {window_node.label} for hwnd {hwnd}, bbox={bbox}")
-            
-            self.plugin.hardware.add_label_to_debug(window_node.label, window_name, role_str, "N/A", bbox)
+            self.plugin.emulator_gui.add_label_to_log(window_node)
         
         return window_node.label
     
@@ -1175,37 +1147,9 @@ class ObjectLayer(RenderLayer):
             self.window_labels[node.hwnd] = new_label
         
         # Update debug log
-        if self.plugin:
-            self.plugin.hardware.remove_label_from_debug(old_label)
+        if self.plugin and self.plugin.emulator_gui:
+            self.plugin.emulator_gui.change_label_in_log(old_label, new_label)
             
-            obj_name = node.name
-            obj = node.obj
-            obj_value = getattr(node.obj, 'value', 'N/A') if obj else 'N/A'
-            obj_value = str(obj_value) if obj_value else 'N/A'
-            role = node.role
-            
-            # Get human-readable role name
-            if role is not None:
-                try:
-                    role_str = controlTypes.Role(role).displayString
-                except:
-                    try:
-                        role_str = controlTypes.roleLabels.get(role, f"Unknown({role})")
-                    except:
-                        role_str = str(role)
-            else:
-                role_str = "Unknown"
-            
-            role_str = str(role_str) if role_str else "Unknown"
-            
-            # Convert location to bbox string
-            if node.location and hasattr(node.location, 'left'):
-                bbox = f"({node.location.left}, {node.location.top}, {node.location.width}, {node.location.height})"
-            else:
-                bbox = str(node.location) if node.location else "N/A"
-            
-            self.plugin.hardware.add_label_to_debug(new_label, obj_name, role_str, obj_value, bbox)
-        
         # Recycle the old label position by resetting depth counter if this label is earlier
         if old_depth in self.depth_counters:
             # If this freed label is less than the current counter, reset to reuse it
@@ -1339,36 +1283,8 @@ class ObjectLayer(RenderLayer):
             self.label_to_zorder[node.label] = self.window_z_orders.get(node.hwnd, 999)
         
         # Add to emulator debug log
-        if self.plugin:
-            obj_name = node.name
-            obj = node.obj
-            obj_value = getattr(obj, 'value', 'N/A') if obj else 'N/A'
-            obj_value = str(obj_value) if obj_value else 'N/A'
-            role = node.role
-            
-            # Get human-readable role name
-            if role is not None:
-                try:
-                    role_str = controlTypes.Role(role).displayString
-                except:
-                    try:
-                        role_str = controlTypes.roleLabels.get(role, f"Unknown({role})")
-                    except:
-                        role_str = str(role)
-            else:
-                role_str = "Unknown"
-            
-            # Ensure role_str is a string
-            role_str = str(role_str) if role_str else "Unknown"
-            
-            # Convert location to bbox string
-            location_rect = node.location
-            if location_rect and hasattr(location_rect, 'left'):
-                bbox = f"({location_rect.left}, {location_rect.top}, {location_rect.width}, {location_rect.height})"
-            else:
-                bbox = str(location_rect) if location_rect else "N/A"
-            
-            self.plugin.hardware.add_label_to_debug(node.label, obj_name, role_str, obj_value, bbox)
+        if self.plugin and self.plugin.emulator_gui:
+            self.plugin.emulator_gui.add_label_to_log(node)
         
         return node.label
     
@@ -1486,12 +1402,13 @@ class ObjectLayer(RenderLayer):
         if label not in self.label_map:
             return False
         
-        # Remove from emulator debug log
-        if self.plugin:
-            self.plugin.hardware.remove_label_from_debug(label)
-        
         # Get node before removing
         node = self.label_map[label]
+        
+        # Remove from emulator debug log
+        if self.plugin and self.plugin.emulator_gui:
+            self.plugin.emulator_gui.remove_label_from_log(label)
+        
         label_depth = node.depth
         label_hwnd = node.hwnd
         

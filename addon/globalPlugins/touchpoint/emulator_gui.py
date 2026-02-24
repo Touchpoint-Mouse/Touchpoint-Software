@@ -13,6 +13,7 @@ import wx
 
 from .dependencies import cv2, np
 from .utils import logMessage
+from .render_layers import TreeNode
 
 
 class TouchpointEmulatorGUI:
@@ -48,7 +49,7 @@ class TouchpointEmulatorGUI:
         self.current_layer_id = None  # Currently selected layer
         
         # Label tracking for debug log - organized by label
-        self.label_info = {}  # {label: {'name': str, 'role': str, 'value': str, 'bbox': str}}
+        self.label_info = {}  # {label: {'name': name, 'role': role, 'value': value, 'hwnd': hwnd}}
         self.label_info_lock = threading.Lock()
         
         # Update timer
@@ -289,22 +290,18 @@ class TouchpointEmulatorGUI:
         if self.is_open and self.frame:
             wx.CallAfter(self._add_vibration_log, amplitude, frequency, duration)
     
-    def add_label_to_log(self, label, name, role, value, bbox):
+    def add_label_to_log(self, node):
         """Add or update a label in the debug log.
         
         Args:
-            label: Label number
-            name: Object name
-            role: Object role string
-            value: Object value
-            bbox: Bounding box string
+            node: Node object to add or update in the log
         """
         with self.label_info_lock:
-            self.label_info[label] = {
-                'name': name,
-                'role': role,
-                'value': value,
-                'bbox': bbox
+            self.label_info[node.label] = {
+                'name': node.name,
+                'role': node.role,
+                'value': node.obj.value if hasattr(node.obj, 'value') else 'N/A',
+                'hwnd': node.hwnd
             }
         
         # Update display if window is open
@@ -320,6 +317,23 @@ class TouchpointEmulatorGUI:
         with self.label_info_lock:
             if label in self.label_info:
                 del self.label_info[label]
+        
+        # Update display if window is open
+        if self.is_open and self.frame:
+            wx.CallAfter(self._update_label_list)
+            
+    def change_label_in_log(self, old_label, new_label):
+        """Change a label number in the debug log.
+        
+        Args:
+            old_label: Existing label number to change
+            new_label: New label number to replace with
+        """
+        with self.label_info_lock:
+            if old_label in self.label_info:
+                info = self.label_info[old_label]
+                del self.label_info[old_label]
+                self.label_info[new_label] = info
         
         # Update display if window is open
         if self.is_open and self.frame:
@@ -398,12 +412,12 @@ class TouchpointEmulatorGUI:
                 for label in sorted(self.label_info.keys()):
                     info = self.label_info[label]
                     # Handle None values safely
-                    role = info.get('role', 'Unknown') or 'Unknown'
+                    role = info.get('role')
                     name = info.get('name', 'Unknown') or 'Unknown'
                     value = info.get('value', 'N/A') or 'N/A'
-                    bbox = info.get('bbox', 'N/A') or 'N/A'
+                    hwnd = info.get('hwnd')
                     
-                    line = f"Label {label:3d} | {role[:15]:15s} | {name[:30]:30s} | {value[:20]:20s} | {bbox}"
+                    line = f"Label {label:3d} | {role:3d} | {name[:30]:30s} | {value[:20]:20s} | {hwnd:3d}"
                     lines.append(line)
                 
                 display_text = "\n".join(lines)
