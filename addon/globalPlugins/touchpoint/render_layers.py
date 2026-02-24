@@ -1,7 +1,7 @@
 import threading
 import controlTypes
 from .dependencies import np, cv2
-from .utils import Rect, logMessage, get_actual_border_mask, get_window_rect, update_window_z_orders, is_desktop_or_shell_window, get_object_window_handle
+from .utils import Rect, logMessage, get_actual_border_mask, get_window_rect, update_window_z_orders, is_desktop_or_shell_window, get_object_window_handle, get_window_z_order
 import time
 import traceback
 import NVDAObjects
@@ -218,6 +218,7 @@ class ObjectRenderer(Renderer):
                                 logMessage(f"[ObjectRenderer] Occlusion: hwnd {hwnd} (z={target_z_order}) covered by hwnd {other_hwnd} (z={other_z_order})")
                                 return True
                         except:
+                            logMessage(f"[ObjectRenderer] Failed to check visibility for hwnd {other_hwnd}")
                             pass
             
             return False
@@ -229,7 +230,7 @@ class ObjectRenderer(Renderer):
         """Create a TreeNode from an NVDA object, safely handling missing attributes."""
         if not obj:
             return None
-        if not obj.hasattr('location') or obj.location is None:
+        if not hasattr(obj, 'location') or obj.location is None:
             return None
         name = obj.name if hasattr(obj, 'name') else 'Unknown'
         role = obj.role if hasattr(obj, 'role') else None
@@ -314,15 +315,15 @@ class ObjectRenderer(Renderer):
                                 if self.object_layer.check_duplicate(node, reacquired_node):
                                     # Update nvda object
                                     node.obj = reacquired_obj
-                                    logMessage(f"[ObjectRenderer] Reacquired label {label} '{name}' - border changed but object unchanged")
+                                    logMessage(f"[ObjectRenderer] Reacquired label {label} '{node.name}' - border changed but object unchanged")
                                     should_invalidate = False
-                            except Exception as e:
-                                pass
+                        except Exception as e:
+                            logMessage(f"[ObjectRenderer] Exception reacquiring object: {e}")
                     
                     if should_invalidate:
                         # Border pixels changed - invalidate this object
                         self.object_layer.remove_label(label)
-                        obj_name = node.obj_info.get('name', 'Unknown')[:20] if node.obj_info else 'Unknown'
+                        obj_name = node.name
                         logMessage(f"[ObjectRenderer] Invalidated label {label} '{obj_name}' - border changed")
                         continue
             
@@ -371,11 +372,12 @@ class ObjectRenderer(Renderer):
                 return None
             
             # Add to object layer
-            self.object_layer.add_label(node)
+            label = self.object_layer.add_label(node)
             
-            return node
+            return node if label > 0 else None
             
         except Exception as e:
+            logMessage(f"[ObjectRenderer] Exception detecting object at point ({x}, {y}): {e}")
             return None
     
     def _perform_mesh_grid_scan(self, region, mesh_width, mesh_height, current_object_image):
@@ -969,8 +971,8 @@ class ObjectLayer(RenderLayer):
         
         # Add to emulator debug log
         if self.plugin:
-            window_name = window_info.get('name', f'Window {hwnd}') or f'Window {hwnd}'
-            role = window_info.get('role')
+            window_name = window_node.name
+            role = window_node.role
             
             # Get human-readable role name
             if role is not None:
@@ -1078,6 +1080,14 @@ class ObjectLayer(RenderLayer):
             # Found a parent - add this node as child and update depth based on parent
             parent_node.add_child(new_node)
             new_node.depth = parent_node.depth + 1
+        
+        # Allocate label for this node based on its depth
+        new_node.label = self._calculate_label_for_depth(new_node.depth)
+        if new_node.label == 0:
+            logMessage(f"[ObjectLayer] ERROR: Failed to allocate label for node at depth {new_node.depth}")
+            return
+        
+        if parent_node:
             logMessage(f"[ObjectLayer] Inserted node {new_node.label} as child of {parent_node.label}, depth={new_node.depth}")
             
             # Check if any of the parent's other children should actually be our children
@@ -1168,11 +1178,11 @@ class ObjectLayer(RenderLayer):
         if self.plugin:
             self.plugin.hardware.remove_label_from_debug(old_label)
             
-            obj_name = node.obj_info.get('name', 'Unknown') or 'Unknown'
-            obj = node.obj_info.get('object')
-            obj_value = getattr(obj, 'value', 'N/A') if obj else 'N/A'
+            obj_name = node.name
+            obj = node.obj
+            obj_value = getattr(node.obj, 'value', 'N/A') if obj else 'N/A'
             obj_value = str(obj_value) if obj_value else 'N/A'
-            role = node.obj_info.get('role')
+            role = node.role
             
             # Get human-readable role name
             if role is not None:
@@ -1293,12 +1303,12 @@ class ObjectLayer(RenderLayer):
             int: The label assigned to this object
         """
         if node is None:
-            return
+            return 0
         
         # Check for duplicates
         for existing_label, existing_node in self.label_map.items():
             if self.check_duplicate(node, existing_node):
-                return
+                return 0
         
         # Get window handle
         node.hwnd = get_object_window_handle(node.obj)
@@ -1315,18 +1325,10 @@ class ObjectLayer(RenderLayer):
             window_label = self._try_create_window_label(node.hwnd)
             if window_label == 0:
                 logMessage(f"[ObjectLayer] add_label: Failed to create window label for hwnd {node.hwnd}")
-                return
+                return 0
             
             # Default to depth 1 - tree insertion will find parent and update depth if needed
             node.depth = 1
-        
-            # Allocate label from the depth range
-            node.label = self._calculate_label_for_depth(node.depth)
-            
-            # Verify label is valid
-            if node.label == 0:
-                logMessage(f"[ObjectLayer] add_label: Failed to allocate label for depth level {node.depth}")
-                return 0
             
             # Insert node into tree - this will find parent or children and update depths recursively
             self._insert_node_into_tree(node)
@@ -1360,6 +1362,7 @@ class ObjectLayer(RenderLayer):
             role_str = str(role_str) if role_str else "Unknown"
             
             # Convert location to bbox string
+            location_rect = node.location
             if location_rect and hasattr(location_rect, 'left'):
                 bbox = f"({location_rect.left}, {location_rect.top}, {location_rect.width}, {location_rect.height})"
             else:
