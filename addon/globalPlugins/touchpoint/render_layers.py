@@ -1,7 +1,7 @@
 import threading
 import controlTypes
 from .dependencies import np, cv2
-from .utils import Rect, logMessage, get_actual_border_mask, get_window_rect, update_window_z_orders, is_desktop_or_shell_window, get_object_window_handle, get_window_z_order
+from .utils import Rect, logMessage, get_actual_border_mask, get_window_rect, get_window_z_orders, get_object_window_handle
 import time
 import traceback
 import NVDAObjects
@@ -960,7 +960,8 @@ class ObjectLayer(RenderLayer):
         
         # Add window to z-order tracking
         if hwnd not in self.window_z_orders:
-            self.window_z_orders[hwnd] = get_window_z_order(hwnd)
+            self.window_z_orders[hwnd] = 999  # Default to bottom if we can't get actual z-order
+            self.update_window_z_orders() # Try to get actual z-orders for all tracked windows
        
         # Update fast lookup arrays with actual z-order
         if window_node.label < len(self.label_to_hwnd):
@@ -1011,11 +1012,13 @@ class ObjectLayer(RenderLayer):
             logMessage(f"[ObjectLayer] _is_window error for '{node.name[:20]}': {e}")
             return False
     
-    def update_z_order_lookups(self):
+    def update_window_z_orders(self):
         """Update the label_to_zorder lookup array when window z-orders change.
         
         This should be called after window_z_orders dict is updated (e.g., on focus change).
         """
+        # Get absolute z_orders for tracked windows
+        self.window_z_orders = get_window_z_orders(list(self.window_z_orders.keys()))
         # Update z-order for all labels belonging to tracked windows
         for label, hwnd in enumerate(self.label_to_hwnd):
             if hwnd > 0:  # Skip background (0) and unallocated labels

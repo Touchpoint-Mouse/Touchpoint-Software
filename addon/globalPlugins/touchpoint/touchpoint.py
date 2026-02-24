@@ -15,7 +15,7 @@ import time
 import sys
 import os
 import ctypes
-from .utils import Rect, logMessage, logUIElement, update_window_z_orders
+from .utils import Rect, logMessage, logUIElement
 from .render_pipeline import RenderPipeline
 from .dependencies import np, cv2, songbird, DEPENDENCIES_AVAILABLE, IMPORT_ERROR
 from .hardware_driver import HardwareDriver
@@ -267,11 +267,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             obj: The window object
             nextHandler: The next event handler in the chain
         """
-        # Update z-orders for all tracked windows when any window gains focus
-        if hasattr(self, 'render_pipeline') and hasattr(self.render_pipeline, 'object_layer'):
-            update_window_z_orders(self.render_pipeline.object_layer.window_z_orders)
-            self.render_pipeline.object_layer.update_z_order_lookups()
-        
         # logUIElement(obj, "foreground")
         # Calls matching object handlers
         self.render_pipeline.object_handler_manager.dispatch_event('foreground', obj)

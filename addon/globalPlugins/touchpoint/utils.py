@@ -1,3 +1,5 @@
+import traceback
+
 import logHandler
 import controlTypes
 import winUser
@@ -228,78 +230,6 @@ def logUIElement(obj, eventName):
     except Exception as e:
         logMessage(f"Error logging UI element: {str(e)}")
 
-def is_desktop_or_shell_window(hwnd):
-    """Check if a window is a desktop or shell window.
-    
-    Desktop/shell windows should not occlude other windows.
-    
-    Args:
-        hwnd: Window handle
-        
-    Returns:
-        bool: True if desktop/shell window
-    """
-    try:
-        if not hwnd:
-            return False
-        
-        # Check window class name
-        class_name = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetClassNameW(hwnd, class_name, 256)
-        class_name_str = class_name.value
-        
-        # Known desktop/shell window classes
-        desktop_classes = ['Progman', 'WorkerW', 'Shell_TrayWnd', 'DV2ControlHost']
-        if class_name_str in desktop_classes:
-            return True
-        
-        return False
-    except:
-        return False
-
-
-def get_window_z_order(hwnd):
-    """Get the z-order position of a window (0 = topmost).
-    
-    NOTE: This counts ALL windows above the given window in the z-order stack,
-    not just tracked windows. For relative comparison between specific windows,
-    use get_relative_z_orders() instead.
-    
-    Args:
-        hwnd: Window handle (HWND)
-    
-    Returns:
-        int: Z-order position (0 = topmost, higher values = behind others)
-        Returns -1 if window not found or error occurs
-    """
-    try:
-        if not hwnd:
-            return -1
-        
-        # GW_HWNDPREV = 3 (get window above this one in z-order)
-        GW_HWNDPREV = 3
-        
-        z_order = 0
-        current_hwnd = hwnd
-        
-        # Count how many windows are above this one
-        while True:
-            prev_hwnd = winUser.getWindow(current_hwnd, GW_HWNDPREV)
-            if not prev_hwnd:
-                break
-            z_order += 1
-            current_hwnd = prev_hwnd
-            
-            # Prevent infinite loop (safety check) - increased limit
-            if z_order > 500:
-                logMessage(f"[get_window_z_order] Exceeded 500 windows for hwnd {hwnd}, stopping")
-                return -1
-        
-        return z_order
-    except Exception as e:
-        logMessage(f"[get_window_z_order] Error for hwnd {hwnd}: {e}")
-        return -1
-
 def get_object_window_handle(obj):
     """Get the window handle from an NVDA object.
     
@@ -401,59 +331,58 @@ def get_actual_border_mask(rect, image_shape):
             mask[rect.bottom - 1, x_start:x_end] = True
     
     return mask
+        
 
-def update_window_z_orders(window_z_orders):
-    """Update z-order values for all tracked windows using absolute ordering.
-    
-    Gets the absolute z-order position for each window (counting windows above it),
-    then normalizes to relative positions among tracked windows.
-    Desktop/shell windows are assigned a high z-order so they don't occlude.
-    
+def get_window_z_orders(hwnds):
+    """Get absolute z-orders for a set of tracked windows, including child windows recursively.
     Args:
-        window_z_orders: Dictionary mapping hwnd -> z-order to update in-place
+        hwnds: Iterable of window handles to get absolute z-orders for
+    Returns:
+        dict: {hwnd -> absolute_z_order} where 0 = frontmost tracked window
     """
+    import ctypes
+    from ctypes import wintypes
+
     try:
-        if not window_z_orders:
-            return
-        
-        # Separate desktop/shell windows from regular windows
-        desktop_windows = []
-        regular_windows = []
-        
-        # Get absolute z-order for each tracked window
-        absolute_z_orders = {}
-        for hwnd in window_z_orders.keys():
-            if is_desktop_or_shell_window(hwnd):
-                desktop_windows.append(hwnd)
-                # Assign very high z-order to desktop windows (always in back)
-                window_z_orders[hwnd] = 9998
-            else:
-                regular_windows.append(hwnd)
-                z_order = get_window_z_order(hwnd)
-                if z_order >= 0:
-                    absolute_z_orders[hwnd] = z_order
-                else:
-                    absolute_z_orders[hwnd] = 9999  # Invalid/hidden window
-        
-        # Sort regular windows by absolute z-order and assign relative positions
-        sorted_windows = sorted(absolute_z_orders.items(), key=lambda x: x[1])
-        
-        # Assign relative z-orders (0 = frontmost among tracked regular windows)
-        for relative_pos, (hwnd, absolute_pos) in enumerate(sorted_windows):
-            if absolute_pos == 9999:
-                window_z_orders[hwnd] = 999  # Mark as unknown
-            else:
-                window_z_orders[hwnd] = relative_pos
-        
-        # Log results
-        valid_z_orders = {hwnd: z for hwnd, z in window_z_orders.items() if z < 999}
-        unknown_count = sum(1 for z in window_z_orders.values() if z >= 999)
-        desktop_count = len(desktop_windows)
-        
-        if valid_z_orders:
-            logMessage(f"[update_window_z_orders] Valid z-orders: {valid_z_orders}, Desktop: {desktop_count}, Unknown: {unknown_count}")
-        elif unknown_count > 0:
-            logMessage(f"[update_window_z_orders] All {unknown_count} windows have unknown z-order")
-        
+        tracked_hwnds = set(hwnds)
+        if not tracked_hwnds:
+            return {}
+
+        z_order_map = {hwnd: 999 for hwnd in tracked_hwnds}
+        user32 = ctypes.windll.user32
+        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        # Use a mutable object to hold the counter so it can be updated in recursion
+        index = [0]
+
+        def enum_child_windows(hwnd_parent):
+            def child_callback(hwnd, lParam):
+                enum_child_windows(hwnd)  # Recurse into children
+                if hwnd in tracked_hwnds and z_order_map[hwnd] == 999:
+                    z_order_map[hwnd] = index[0]
+                index[0] += 1
+                return True
+            user32.EnumChildWindows(hwnd_parent, EnumWindowsProc(child_callback), 0)
+
+        def enum_windows_callback(hwnd, lParam):
+            enum_child_windows(hwnd)
+            if hwnd in tracked_hwnds and z_order_map[hwnd] == 999:
+                z_order_map[hwnd] = index[0]
+            index[0] += 1
+            return True
+
+        try:
+            user32.EnumWindows(EnumWindowsProc(enum_windows_callback), 0)
+        except Exception as e:
+            logMessage(f"[get_absolute_z_orders] EnumWindows/EnumChildWindows failed: {e}")
+            return {hwnd: 999 for hwnd in tracked_hwnds}
+
+        # Log results for debugging
+        missing = [hwnd for hwnd in tracked_hwnds if z_order_map[hwnd] == 999]
+        logMessage(f"[get_absolute_z_orders] Found {len(tracked_hwnds)-len(missing)}/{len(tracked_hwnds)} tracked windows (including children). Missing: {missing[:5]} (z-order 0 means topmost)")
+        return z_order_map
     except Exception as e:
-        logMessage(f"Error updating window z-orders: {e}")
+        logMessage(f"[get_absolute_z_orders] Error: {e}")
+        logMessage(f"[get_absolute_z_orders] Traceback: {traceback.format_exc()}")
+    return {hwnd: 999 for hwnd in hwnds}
+
