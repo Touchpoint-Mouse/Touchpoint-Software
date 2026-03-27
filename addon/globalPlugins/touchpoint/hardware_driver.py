@@ -115,6 +115,21 @@ class HardwareDriver:
             if not self.uart.is_open():
                 # Attempt to reopen port
                 self.initialize(health_check=False)
+            else:
+                # Send ping and check for response
+                if not self._wait_for_ping():
+                    logMessage("Hardware ping failed during health check")
+                    self.hardware_connected = False
+                    # Update emulator GUI hardware status if available
+                    if self.plugin.emulator_gui:
+                        self.plugin.emulator_gui.set_hardware_status(False)
+                else:
+                    if not self.hardware_connected:
+                        logMessage("Hardware reconnected successfully")
+                    self.hardware_connected = True
+                    # Update emulator GUI hardware status if available
+                    if self.plugin.emulator_gui:
+                        self.plugin.emulator_gui.set_hardware_status(True)
         
     def send_vibration(self, amplitude, frequency, duration):
         """Send a vibration command to the device."""

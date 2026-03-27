@@ -6,7 +6,7 @@
         "vibration": 32
     },
     "serial": {
-        "port": "COM6",
+        "port": "COM5",
         "baud_rate": 460800
     },
     "display": {
