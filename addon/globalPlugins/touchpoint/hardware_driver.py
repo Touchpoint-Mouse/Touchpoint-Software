@@ -49,6 +49,12 @@ class HardwareDriver:
         
         # Maximum vibration intensity (units) - read-only from config
         self.max_vibration_intensity = hw_config['vibration']['max_intensity']
+
+        # Per-command enable flags (default to enabled when keys are missing)
+        command_enable = hw_config.get('command_enable', {})
+        self.enable_elevation_commands = command_enable.get('elevation', True)
+        self.enable_vibration_effect_commands = command_enable.get('vibration_effect', True)
+        self.enable_vibration_intensity_commands = command_enable.get('vibration_intensity', True)
         
         # Display resolution (equivalent dots per display region)
         self.resolution = hw_config['display']['resolution']
@@ -144,6 +150,9 @@ class HardwareDriver:
         priority = self._to_byte(priority)
         effect_ids = [self._to_byte(effect_id) for effect_id in effect_ids]
 
+        if not self.enable_vibration_effect_commands:
+            return
+
         if self.hardware_connected:
             # Send to hardware
             pkt = self.uart_core.create_packet(self.H_VIBRATION_EFFECT)
@@ -161,6 +170,9 @@ class HardwareDriver:
         """Send a vibration intensity command to the device."""
         priority = self._to_byte(priority)
         intensity = self._to_byte(intensity)
+
+        if not self.enable_vibration_intensity_commands:
+            return
         
         # Clips intensity to max from config
         if intensity > self.max_vibration_intensity:
@@ -199,6 +211,9 @@ class HardwareDriver:
             elevation: Elevation value to send (0.0-1.0)
             priority: Priority level of the command (higher values override lower ones)
         """
+        if not self.enable_elevation_commands:
+            return
+
         # Update global elevation command if higher priority
         if self.global_elevation_command is None or priority >= self.global_elevation_command[1]:
             self.global_elevation_command = (elevation, priority)

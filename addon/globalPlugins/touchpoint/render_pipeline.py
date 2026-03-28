@@ -3,6 +3,8 @@ Render pipeline architecture for Touchpoint NVDA addon.
 Manages render layers, renderers, and event handlers in a cohesive system.
 """
 
+import inspect
+
 from .utils import logMessage
 from .render_layers import (
     RenderLayer,
@@ -11,11 +13,13 @@ from .render_layers import (
     CaptureRenderer,
     ObjectRenderer,
     DepthRenderer,
+    GraphicRenderer,
     ObjectDepthRenderer,
     ElevationRenderer
 )
 from .effects import ComboEffect, GlobalElevationEffect, VibrationEffect, VibrationIntensityEffect
 from .handlers import ObjectHandler, ScreenBorderHandler, ObjectHandlerManager, GlobalHandlerManager
+from .filters import GraphicFilter
 from .dependencies import np
 
 
@@ -66,29 +70,110 @@ class RenderPipeline:
     
     def _create_renderers(self):
         """Create renderers that operate on layers."""
-        self.capture_renderer = CaptureRenderer(self.capture_layer)
-        self.object_renderer = ObjectRenderer(self.capture_layer, self.object_layer)
-        self.depth_renderer = DepthRenderer(self.capture_layer, self.depth_layer)  # DISABLED
-        self.object_depth_renderer = ObjectDepthRenderer(self.object_layer, self.depth_layer)
-        self.elevation_renderer = ElevationRenderer(self.depth_layer)
+        self.capture_renderer = self._create_renderer_instance(
+            "capture_renderer",
+            CaptureRenderer,
+            self.capture_layer,
+        )
+        self.object_renderer = self._create_renderer_instance(
+            "object_renderer",
+            ObjectRenderer,
+            self.capture_layer,
+            self.object_layer,
+        )
+        self.depth_renderer = self._create_renderer_instance(
+            "depth_renderer",
+            DepthRenderer,
+            self.capture_layer,
+            self.depth_layer,
+        )
+        self.graphic_renderer = self._create_renderer_instance(
+            "graphic_renderer",
+            GraphicRenderer,
+            self.capture_layer,
+            self.depth_layer,
+        )
+        self.object_depth_renderer = self._create_renderer_instance(
+            "object_depth_renderer",
+            ObjectDepthRenderer,
+            self.object_layer,
+            self.depth_layer,
+        )
+        self.elevation_renderer = self._create_renderer_instance(
+            "elevation_renderer",
+            ElevationRenderer,
+            self.depth_layer,
+        )
         
         # Set plugin reference for all renderers
         for renderer in self.get_renderers():
             renderer.set_plugin(self.plugin)
+
+    def _get_renderer_config_kwargs(self, renderer_name):
+        """Get kwargs for a renderer from software config.
+
+        Expected config shape:
+            software.renderers.<renderer_name>.<property>
+        """
+        renderers_config = self.config.software.get("renderers", {})
+        if not isinstance(renderers_config, dict):
+            return {}
+
+        renderer_kwargs = renderers_config.get(renderer_name, {})
+        if not isinstance(renderer_kwargs, dict):
+            logMessage(f"[RenderPipeline] Ignoring non-dict renderer config for '{renderer_name}'")
+            return {}
+
+        return dict(renderer_kwargs)
+
+    def _create_renderer_instance(self, renderer_name, renderer_class, *args):
+        """Instantiate renderer_class with filtered kwargs from config."""
+        configured_kwargs = self._get_renderer_config_kwargs(renderer_name)
+        if not configured_kwargs:
+            return renderer_class(*args)
+
+        init_sig = inspect.signature(renderer_class.__init__)
+        params = [p for p in init_sig.parameters.values() if p.name != "self"]
+        positional_params = [
+            p for p in params
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        consumed_positional_names = {p.name for p in positional_params[:len(args)]}
+
+        accepts_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params)
+        valid_names = {p.name for p in params}
+
+        filtered_kwargs = {}
+        dropped_keys = []
+        for key, value in configured_kwargs.items():
+            if key in consumed_positional_names:
+                dropped_keys.append(key)
+                continue
+            if accepts_var_kwargs or key in valid_names:
+                filtered_kwargs[key] = value
+            else:
+                dropped_keys.append(key)
+
+        if dropped_keys:
+            logMessage(
+                f"[RenderPipeline] Ignored unsupported kwargs for '{renderer_name}': {sorted(dropped_keys)}"
+            )
+
+        return renderer_class(*args, **filtered_kwargs)
     
     def _create_handlers(self):
         """Create object and global event handlers."""
         # Object handlers for UI element events
         self.object_handlers = [
-            ObjectHandler(effects={
+            ObjectHandler(filter=GraphicFilter(), effects={
                 'enter': ComboEffect([
                     VibrationEffect(effect_ids=[7], priority=1),
-                    lambda effect, obj=None, **kwargs: logMessage(f"Mouse entered: {obj.name if obj and obj.name else 'Unnamed'}")
+                    lambda effect, obj=None, **kwargs: logMessage(f"Mouse entered image: {obj.name if obj and obj.name else 'Unnamed'}")
                 ]),
                 'leave': ComboEffect([
                     GlobalElevationEffect(0),
                     VibrationEffect(effect_ids=[8], priority=1),
-                    lambda effect, obj=None, **kwargs: logMessage(f"Mouse left: {obj.name if obj and obj.name else 'Unnamed'}")
+                    lambda effect, obj=None, **kwargs: logMessage(f"Mouse left image: {obj.name if obj and obj.name else 'Unnamed'}")
                 ])
             })
         ]
@@ -151,9 +236,10 @@ class RenderPipeline:
         """
         return [
             self.capture_renderer,
-            self.object_renderer,
-            # self.depth_renderer,  # DISABLED - using object_depth_renderer instead
-            self.object_depth_renderer,
+            #self.object_renderer,
+            self.graphic_renderer,
+            # self.depth_renderer,  # Temporarily disabled
+            # self.object_depth_renderer,  # TEMPORARILY DISABLED
             self.elevation_renderer
         ]
     

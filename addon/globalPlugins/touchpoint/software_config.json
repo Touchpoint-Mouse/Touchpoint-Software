@@ -15,5 +15,15 @@
   "depth_label_allocation": {
     "max_depth": 50,
     "labels_per_depth": 100
+  },
+  "renderers": {
+    "graphic_renderer": {
+      "ksize": 7,
+      "invert": 1,
+      "elevation_scale": 0.5
+    },
+    "elevation_renderer": {
+      "priority": 1
+    }
   }
 }

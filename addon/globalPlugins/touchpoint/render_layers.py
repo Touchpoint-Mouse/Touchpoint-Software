@@ -1,6 +1,7 @@
 import threading
 import controlTypes
 from .dependencies import np, cv2
+from .filters import GraphicFilter
 from .utils import Rect, logMessage, get_actual_border_mask, get_window_rect, get_window_z_orders, get_object_window_handle
 import time
 import traceback
@@ -514,6 +515,106 @@ class DepthRenderer(Renderer):
         # except Exception as e:
         #     logMessage(f"[ERROR] DepthRenderer failed: {e}")
 
+
+class GraphicRenderer(Renderer):
+    """Renderer that generates a depth map from graphic content under the mouse."""
+
+    def __init__(self, capture_layer, depth_layer, filter=None, ksize=7, invert=1, elevation_scale=0.5):
+        """Initialize with references to layers and processing parameters.
+
+        Args:
+            capture_layer: CaptureLayer to read from
+            depth_layer: DepthLayer to write to
+            filter: Object filter used to gate processing to graphics
+            ksize: Gaussian blur kernel size (odd integer; <=1 disables blur)
+            invert: 1 for normal, -1 for inverted depth map
+            elevation_scale: Scalar applied to normalized depth prior to max elevation scaling
+        """
+        self.capture_layer = capture_layer
+        self.depth_layer = depth_layer
+        self.filter = filter if filter is not None else GraphicFilter()
+        self.ksize = int(ksize)
+        self.invert = -1 if invert == -1 else 1
+        self.elevation_scale = float(elevation_scale)
+
+    def _zero_depth(self):
+        """Clear depth layer when no valid graphic target is active."""
+        self.depth_layer.update_image(np.zeros((0, 0), dtype=np.float32))
+
+    def __call__(self):
+        """Generate depth map from capture image and write it to depth layer."""
+        try:
+            if not self.plugin or not self.plugin.hardware:
+                return
+
+            capture_img = self.capture_layer.get_image()
+            if capture_img.size == 0:
+                self._zero_depth()
+                return
+
+            region = self.capture_layer.current_region
+            if region.width <= 0 or region.height <= 0:
+                self._zero_depth()
+                return
+
+            mouse_pos = self.plugin.get_mouse_position()
+            if (mouse_pos[0] < region.left or mouse_pos[0] >= region.right or
+                    mouse_pos[1] < region.top or mouse_pos[1] >= region.bottom):
+                self._zero_depth()
+                return
+
+            obj = self.plugin.get_mouse_object() if hasattr(self.plugin, 'get_mouse_object') else None
+            if not self.filter.matches(self.plugin, obj):
+                self._zero_depth()
+                return
+
+            if not hasattr(obj, 'location') or obj.location is None:
+                self._zero_depth()
+                return
+
+            obj_rect = Rect(
+                obj.location.left,
+                obj.location.top,
+                width=obj.location.width,
+                height=obj.location.height,
+            )
+            image_region = obj_rect.intersection(region)
+            if not image_region:
+                self._zero_depth()
+                return
+
+            depth_map = cv2.cvtColor(capture_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+            ksize = self.ksize if self.ksize % 2 == 1 else self.ksize + 1
+            if ksize > 1:
+                depth_map = cv2.GaussianBlur(depth_map, (ksize, ksize), 0)
+
+            depth_map = depth_map / 255.0
+            if self.invert == -1:
+                depth_map = 1.0 - depth_map
+
+            max_elevation = float(self.plugin.hardware.get_max_elevation())
+            depth_map = depth_map * self.elevation_scale * max_elevation
+
+            # Keep depth only inside the hovered image bounding box; suppress background.
+            bbox_local = image_region.global_to_local(region.top_left())
+            mask = np.zeros_like(depth_map, dtype=bool)
+            mask[bbox_local.top:bbox_local.bottom, bbox_local.left:bbox_local.right] = True
+            depth_map[~mask] = 0.0
+
+            padding = self.plugin.config.capture_padding
+            depth_for_layer = depth_map
+            if padding > 0:
+                h, w = depth_for_layer.shape[:2]
+                if h > 2 * padding and w > 2 * padding:
+                    depth_for_layer = depth_for_layer[padding:h-padding, padding:w-padding]
+
+            self.depth_layer.update_image(depth_for_layer.astype(np.float32, copy=False))
+
+        except Exception as e:
+            logMessage(f"[ERROR] GraphicRenderer failed: {e}")
+            logMessage(traceback.format_exc())
+
 class ObjectDepthRenderer(Renderer):
     """Renderer that reads from object layer and writes scaled depth to depth layer."""
     
@@ -610,7 +711,7 @@ class ElevationRenderer(Renderer):
             # Read value from center pixel
             center_value = depth_img[center_y, center_x]  # All channels are same in grayscale
             
-            # Send elevation to hardware (non-priority so it can be overridden)
+            # Send elevation to hardware
             if self.plugin and self.plugin.hardware:
                 self.plugin.hardware.set_global_elevation(center_value, priority=self.priority)
         except Exception as e:

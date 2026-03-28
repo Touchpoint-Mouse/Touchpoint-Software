@@ -76,7 +76,12 @@ class TouchpointConfig:
                 "serial": {"port": "COM6", "baud_rate": 460800},
                 "display": {"resolution": 36.0, "aspect_ratio": 0.5},
                 "elevation": {"max_elevation": 180, "max_elevation_speed": 180},
-                "vibration": {"max_intensity": 127}
+                "vibration": {"max_intensity": 127},
+                "command_enable": {
+                    "elevation": True,
+                    "vibration_effect": True,
+                    "vibration_intensity": True
+                }
             }
     
     def _load_software_config(self):
@@ -95,7 +100,17 @@ class TouchpointConfig:
             return {
                 "capture_region": {"area": 10000, "aspect_ratio": 1.0},
                 "layer_multipliers": {"depth": 4.0, "texture": 1.0},
-                "threading": {"capture": 0.01, "render": 0.01}
+                "threading": {"capture": 0.01, "render": 0.01},
+                "renderers": {
+                    "graphic_renderer": {
+                        "ksize": 7,
+                        "invert": 1,
+                        "elevation_scale": 0.5
+                    },
+                    "elevation_renderer": {
+                        "priority": 1
+                    }
+                }
             }
     
     def _validate_config(self):

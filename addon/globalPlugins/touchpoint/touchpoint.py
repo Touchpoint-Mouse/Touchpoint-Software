@@ -65,6 +65,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Mouse position tracking (updated by event thread)
         self.mouse_position = (0, 0)
         self.mouse_position_lock = threading.Lock()
+        self.last_mouse_object = None
+        self.last_mouse_object_id = None
         
         # Debug logging timer
         self.last_debug_log_time = 0
@@ -123,6 +125,37 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         with self.mouse_position_lock:
             return self.mouse_position
+
+    def get_mouse_object(self):
+        """Get the object currently tracked under the mouse by the render thread."""
+        return self.last_mouse_object
+
+    def _get_object_identity(self, obj):
+        """Build a stable identity key for mouse-enter/leave object tracking."""
+        if obj is None:
+            return None
+
+        location = getattr(obj, 'location', None)
+        location_key = None
+        if location is not None:
+            location_key = (location.left, location.top, location.width, location.height)
+
+        return (
+            getattr(obj, 'windowHandle', None),
+            getattr(obj, 'role', None),
+            getattr(obj, 'name', None),
+            location_key,
+        )
+
+    def _dispatch_mouse_object_transitions(self, mouse_pos):
+        """Dispatch object enter/leave events from render thread using per-handler state."""
+        try:
+            obj = NVDAObjects.NVDAObject.objectFromPoint(int(mouse_pos[0]), int(mouse_pos[1]))
+            self.last_mouse_object = obj
+            self.last_mouse_object_id = self._get_object_identity(obj)
+            self.render_pipeline.object_handler_manager.dispatch_mouse_transitions(obj, mouse_pos)
+        except Exception as e:
+            logMessage(f"[ERROR] Mouse object transition dispatch failed: {e}")
     
     def _log_object_under_mouse(self, mouse_pos):
         """Log information about the object under the mouse cursor.
@@ -192,6 +225,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             with self.mouse_position_lock:
                 # Update mouse position variable
                 self.mouse_position = current_pos
+
+            # Route mouse enter/leave event transitions through render thread to avoid cross-thread conflicts.
+            self._dispatch_mouse_object_transitions(current_pos)
             
             # Calculate new region centered on current mouse position
             new_region = Rect(

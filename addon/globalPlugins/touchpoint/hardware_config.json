@@ -20,5 +20,10 @@
     },
     "vibration": {
         "max_intensity": 127
+    },
+    "command_enable": {
+        "elevation": true,
+        "vibration_effect": true,
+        "vibration_intensity": true
     }
 }
