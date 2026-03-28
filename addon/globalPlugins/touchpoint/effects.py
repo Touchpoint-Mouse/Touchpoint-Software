@@ -23,24 +23,36 @@ class ComboEffect(Effect):
             effect(handler, obj, **kwargs)
     
 class VibrationEffect(Effect):
-    """Effect to send a vibration command to the Touchpoint device."""
+    """Effect to send vibration effect IDs using the new hardware protocol."""
     
-    def __init__(self, amplitude=0.5, frequency=150.0, duration=500):
+    def __init__(self, effect_ids=None, priority=1):
         """
         Initialize the VibrationEffect.
         
         Args:
-            amplitude (float): Vibration amplitude (0.0 to 1.0)
-            frequency (float): Vibration frequency in Hz
-            duration (int): Vibration duration in milliseconds
+            effect_ids (list[int]): New protocol effect IDs to trigger
+            priority (int): New protocol effect priority byte
         """
-        self.amplitude = amplitude
-        self.frequency = frequency
-        self.duration = duration
+        self.effect_ids = [int(max(0, min(255, round(effect_id)))) for effect_id in (effect_ids or [])]
+        self.priority = int(max(0, min(255, priority)))
         
     def __call__(self, handler, obj=None, **kwargs):
-        """Execute the vibration effect."""
-        handler.plugin.hardware.send_vibration(self.amplitude, self.frequency, self.duration)
+        """Execute the vibration effect ID command."""
+        if self.effect_ids:
+            handler.plugin.hardware.send_vibration_effects(self.priority, self.effect_ids)
+
+
+class VibrationIntensityEffect(Effect):
+    """Effect to send vibration intensity using the new hardware protocol."""
+
+    def __init__(self, intensity=0, priority=1):
+        """Initialize the VibrationIntensityEffect."""
+        self.intensity = int(max(0, min(255, round(intensity))))
+        self.priority = int(max(0, min(255, priority)))
+
+    def __call__(self, handler, obj=None, **kwargs):
+        """Execute the vibration intensity command."""
+        handler.plugin.hardware.send_vibration_intensity(self.priority, self.intensity)
 
 class GlobalElevationEffect(Effect):
     """ Effect to set the global elevation of the Touchpoint device. """
@@ -57,7 +69,7 @@ class GlobalElevationEffect(Effect):
         
     def __call__(self, handler, obj=None, **kwargs):
         """Execute the global elevation effect."""
-        handler.plugin.hardware.send_elevation(self.elevation, priority=self.priority)
+        handler.plugin.hardware.set_global_elevation(self.elevation, priority=self.priority)
         
 class RelativeElevationEffect(Effect):
     """ Effect to set the relative elevation of the Touchpoint device. Overidden by absolute elevation effects. """

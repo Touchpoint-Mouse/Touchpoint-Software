@@ -14,7 +14,7 @@ from .render_layers import (
     ObjectDepthRenderer,
     ElevationRenderer
 )
-from .effects import ComboEffect, GlobalElevationEffect, VibrationEffect
+from .effects import ComboEffect, GlobalElevationEffect, VibrationEffect, VibrationIntensityEffect
 from .handlers import ObjectHandler, ScreenBorderHandler, ObjectHandlerManager, GlobalHandlerManager
 from .dependencies import np
 
@@ -57,7 +57,7 @@ class RenderPipeline:
         
         self.capture_layer = RenderLayer(id="capture", dtype=np.uint8, num_channels=3)  # BGR color
         self.object_layer = ObjectLayer(id="object", max_depth=max_depth, labels_per_depth=labels_per_depth)  # Dynamic size follows capture region
-        self.depth_layer = RenderLayer(id="depth", dtype=np.uint8, constant_size=layer_dims['depth'], num_channels=1)  # Grayscale
+        self.depth_layer = RenderLayer(id="depth", dtype=np.float32, constant_size=layer_dims['depth'], num_channels=1)  # Grayscale elevation values
         self.texture_layer = RenderLayer(id="texture", dtype=np.uint8, constant_size=layer_dims['texture'])  # BGR color
         
         # Set plugin reference for all layers
@@ -82,12 +82,12 @@ class RenderPipeline:
         self.object_handlers = [
             ObjectHandler(effects={
                 'enter': ComboEffect([
-                    VibrationEffect(0.1, 180.0, 1),
+                    VibrationEffect(effect_ids=[7], priority=1),
                     lambda effect, obj=None, **kwargs: logMessage(f"Mouse entered: {obj.name if obj and obj.name else 'Unnamed'}")
                 ]),
                 'leave': ComboEffect([
                     GlobalElevationEffect(0),
-                    VibrationEffect(0.05, 80.0, 1),
+                    VibrationEffect(effect_ids=[8], priority=1),
                     lambda effect, obj=None, **kwargs: logMessage(f"Mouse left: {obj.name if obj and obj.name else 'Unnamed'}")
                 ])
             })
@@ -97,11 +97,11 @@ class RenderPipeline:
         self.global_handlers = [
             ScreenBorderHandler(effects={
                 'border_enter': ComboEffect([
-                    VibrationEffect(0.1, 200.0, 0),
+                    VibrationIntensityEffect(intensity=127, priority=255),
                     lambda effect, obj=None, **kwargs: logMessage("Screen border entered")
                 ]),
                 'border_leave': ComboEffect([
-                    VibrationEffect(0, 0, 0),
+                    VibrationIntensityEffect(intensity=0, priority=255),
                     lambda effect, obj=None, **kwargs: logMessage("Screen border left")
                 ])
             })

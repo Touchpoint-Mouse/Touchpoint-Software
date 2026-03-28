@@ -278,17 +278,15 @@ class TouchpointEmulatorGUI:
         """
         self.max_elevation = max_elevation
     
-    def set_vibration(self, amplitude, frequency, duration):
-        """Set vibration parameters.
-        
-        Args:
-            amplitude: Vibration amplitude (0.0-1.0)
-            frequency: Vibration frequency in Hz
-            duration: Duration in pulses (0 for indefinite)
-        """
-        # Add to event log if window is open
+    def set_vibration_effect(self, effect_id, priority=1):
+        """Log a vibration effect command from the hardware driver."""
         if self.is_open and self.frame:
-            wx.CallAfter(self._add_vibration_log, amplitude, frequency, duration)
+            wx.CallAfter(self._add_vibration_effect_log, int(effect_id), int(priority))
+
+    def set_vibration_intensity(self, priority, intensity):
+        """Log a vibration intensity command from the hardware driver."""
+        if self.is_open and self.frame:
+            wx.CallAfter(self._add_vibration_intensity_log, int(priority), int(intensity))
     
     def add_label_to_log(self, node):
         """Add or update a label in the debug log.
@@ -371,31 +369,45 @@ class TouchpointEmulatorGUI:
                 # Remove empty images
                 del self.layer_images[layer_id]
     
-    def _add_vibration_log(self, amplitude, frequency, duration):
-        """Add vibration event to log."""
+    def _append_vibration_log(self, log_entry):
+        """Append a single line to the vibration event log and keep it bounded."""
+        self.vibration_log.AppendText(log_entry)
+
+        # Limit log to last 100 lines
+        line_count = self.vibration_log.GetNumberOfLines()
+        if line_count > 100:
+            # Remove first line
+            first_line_end = self.vibration_log.XYToPosition(0, 1)
+            self.vibration_log.Remove(0, first_line_end)
+
+        # Scroll to the end to show the latest entry
+        self.vibration_log.SetInsertionPointEnd()
+
+    def _vibration_timestamp(self):
+        """Get a timestamp string with millisecond precision for vibration logs."""
+        current_time = time.time()
+        timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
+        milliseconds = int((current_time % 1) * 1000)
+        return f"{timestamp}.{milliseconds:03d}"
+
+    def _add_vibration_effect_log(self, effect_id, priority):
+        """Add vibration effect command to log."""
         try:
-            current_time = time.time()
-            timestamp = time.strftime("%H:%M:%S", time.localtime(current_time))
-            milliseconds = int((current_time % 1) * 1000)
-            timestamp_with_ms = f"{timestamp}.{milliseconds:03d}"
-            dur_str = "indefinite" if duration == 0 else f"{duration}pulses"
-            
-            if amplitude == 0.0 or frequency == 0.0:
-                log_entry = f"[{timestamp_with_ms}] Vibration stopped\n"
+            timestamp_with_ms = self._vibration_timestamp()
+            log_entry = f"[{timestamp_with_ms}] Effect cmd | Pri: {priority:3d} | ID: {effect_id:3d}\n"
+            self._append_vibration_log(log_entry)
+        except Exception as e:
+            logMessage(f"[ERROR] Failed to add vibration log: {e}")
+
+    def _add_vibration_intensity_log(self, priority, intensity):
+        """Add vibration intensity command to log."""
+        try:
+            timestamp_with_ms = self._vibration_timestamp()
+            if intensity <= 0:
+                log_entry = f"[{timestamp_with_ms}] Intensity cmd | Pri: {priority:3d} | Value:   0 (stop)\n"
             else:
-                log_entry = f"[{timestamp_with_ms}] Amp: {amplitude:.3f}  Freq: {frequency:6.1f}Hz  Dur: {dur_str}\n"
-            
-            self.vibration_log.AppendText(log_entry)
-            
-            # Limit log to last 100 lines
-            line_count = self.vibration_log.GetNumberOfLines()
-            if line_count > 100:
-                # Remove first line
-                first_line_end = self.vibration_log.XYToPosition(0, 1)
-                self.vibration_log.Remove(0, first_line_end)
-            
-            # Scroll to the end to show the latest entry
-            self.vibration_log.SetInsertionPointEnd()
+                log_entry = f"[{timestamp_with_ms}] Intensity cmd | Pri: {priority:3d} | Value: {intensity:3d}\n"
+            self._append_vibration_log(log_entry)
         except Exception as e:
             logMessage(f"[ERROR] Failed to add vibration log: {e}")
     
@@ -500,7 +512,7 @@ class TouchpointEmulatorGUI:
                 self.current_elevation += max_change if diff > 0 else -max_change
         
         # Update displays - show raw elevation value and max
-        self.elevation_value_label.SetLabel(f"{self.current_elevation:.1f} / {self.max_elevation}")
+        self.elevation_value_label.SetLabel(f"{self.current_elevation:.2f} / {self.max_elevation}")
         
         # Trigger repaints
         self.elevation_panel.Refresh()
@@ -610,10 +622,24 @@ class TouchpointEmulatorGUI:
             # Determine if image is grayscale or color
             if len(layer_image.shape) == 2:
                 # Grayscale image - apply colormap
-                layer_colored = cv2.applyColorMap(layer_image, self.colormap_cv2)
+                layer_for_display = layer_image
+                if layer_for_display.dtype != np.uint8:
+                    max_val = float(np.max(layer_for_display)) if layer_for_display.size > 0 else 0.0
+                    if max_val > 0:
+                        layer_for_display = np.clip((layer_for_display / max_val) * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        layer_for_display = np.zeros_like(layer_for_display, dtype=np.uint8)
+                layer_colored = cv2.applyColorMap(layer_for_display, self.colormap_cv2)
             elif len(layer_image.shape) == 3 and layer_image.shape[2] == 1:
                 # Single channel as 3D array - apply colormap
-                layer_colored = cv2.applyColorMap(layer_image[:, :, 0], self.colormap_cv2)
+                layer_for_display = layer_image[:, :, 0]
+                if layer_for_display.dtype != np.uint8:
+                    max_val = float(np.max(layer_for_display)) if layer_for_display.size > 0 else 0.0
+                    if max_val > 0:
+                        layer_for_display = np.clip((layer_for_display / max_val) * 255.0, 0, 255).astype(np.uint8)
+                    else:
+                        layer_for_display = np.zeros_like(layer_for_display, dtype=np.uint8)
+                layer_colored = cv2.applyColorMap(layer_for_display, self.colormap_cv2)
             else:
                 # Already color (BGR format from capture)
                 layer_colored = layer_image

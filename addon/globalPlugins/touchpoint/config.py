@@ -66,10 +66,17 @@ class TouchpointConfig:
             logMessage(f"[ERROR] Failed to load hardware config: {e}")
             # Return default configuration
             return {
-                "headers": {"ping": 255, "elevation": 16, "elevation_speed": 17, "vibration": 32},
+                "headers": {
+                    "ping": 255,
+                    "elevation": 16,
+                    "elevation_speed": 17,
+                    "vibration_effect": 32,
+                    "vibration_intensity": 33
+                },
                 "serial": {"port": "COM6", "baud_rate": 460800},
                 "display": {"resolution": 36.0, "aspect_ratio": 0.5},
-                "elevation": {"max_elevation": 180, "max_elevation_speed": 180}
+                "elevation": {"max_elevation": 180, "max_elevation_speed": 180},
+                "vibration": {"max_intensity": 127}
             }
     
     def _load_software_config(self):

@@ -538,8 +538,8 @@ class ObjectDepthRenderer(Renderer):
             # Get max elevation from hardware
             max_elevation = self.plugin.hardware.get_max_elevation()
             
-            # Create depth map with same dimensions as object layer
-            depth_map = np.zeros_like(object_img, dtype=np.uint8)
+            # Create float depth map with same dimensions as object layer
+            depth_map = np.zeros_like(object_img, dtype=np.float32)
             
             # Scale object labels to depth values
             # Higher labels (more in front) = higher depth values
@@ -553,7 +553,7 @@ class ObjectDepthRenderer(Renderer):
                 # Scale labels to depth range
                 # Use linear scaling: depth = (label / max_label) * max_elevation
                 mask = object_img > 0  # Non-background pixels
-                depth_map[mask] = ((object_img[mask].astype(np.float32) / max_label) * max_elevation).astype(np.uint8)
+                depth_map[mask] = (object_img[mask].astype(np.float32) / max_label) * max_elevation
             
             # Get padding from config to crop to hardware area
             padding = self.plugin.config.capture_padding

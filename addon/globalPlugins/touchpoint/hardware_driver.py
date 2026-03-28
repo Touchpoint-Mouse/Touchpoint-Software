@@ -18,7 +18,8 @@ class HardwareDriver:
         self.H_PING = hw_config['headers']['ping']
         self.H_ELEVATION = hw_config['headers']['elevation']
         self.H_ELEVATION_SPEED = hw_config['headers']['elevation_speed']
-        self.H_VIBRATION = hw_config['headers']['vibration']
+        self.H_VIBRATION_EFFECT = hw_config['headers']['vibration_effect']
+        self.H_VIBRATION_INTENSITY = hw_config['headers']['vibration_intensity']
         
         # Serial configuration from config
         self.SERIAL_PORT = hw_config['serial']['port']
@@ -46,6 +47,9 @@ class HardwareDriver:
         # Maximum elevation speed (units per second) - can be changed dynamically
         self.max_elevation_speed = hw_config['elevation']['max_elevation_speed']
         
+        # Maximum vibration intensity (units) - read-only from config
+        self.max_vibration_intensity = hw_config['vibration']['max_intensity']
+        
         # Display resolution (equivalent dots per display region)
         self.resolution = hw_config['display']['resolution']
         # Aspect ratio of texture pixels (width/height)
@@ -53,6 +57,10 @@ class HardwareDriver:
         
         # Mesh dimensions (calculated from resolution and aspect ratio)
         self.mesh_dims = self.config.get_mesh_dimensions()
+
+    def _to_byte(self, value):
+        """Clamp and cast numeric values to a uint8-compatible integer."""
+        return max(0, min(255, int(round(value))))
     
     def initialize(self, health_check=True):
         """Initialize the hardware driver and establish communication."""
@@ -131,19 +139,43 @@ class HardwareDriver:
                     if self.plugin.emulator_gui:
                         self.plugin.emulator_gui.set_hardware_status(True)
         
-    def send_vibration(self, amplitude, frequency, duration):
-        """Send a vibration command to the device."""
+    def send_vibration_effects(self, priority, effect_ids):
+        """Send vibration effects to the device."""
+        priority = self._to_byte(priority)
+        effect_ids = [self._to_byte(effect_id) for effect_id in effect_ids]
+
         if self.hardware_connected:
             # Send to hardware
-            pkt = self.uart_core.create_packet(self.H_VIBRATION)
-            pkt.write_float(amplitude)
-            pkt.write_float(frequency)
-            pkt.write_int16(duration)
+            pkt = self.uart_core.create_packet(self.H_VIBRATION_EFFECT)
+            pkt.write_byte(priority)
+            for effect_id in effect_ids:
+                pkt.write_byte(effect_id)
             self.uart_core.send_packet(pkt)
                     
         # Update emulator GUI
         if self.plugin.emulator_gui:
-            self.plugin.emulator_gui.set_vibration(amplitude, frequency, duration)
+            for effect_id in effect_ids:
+                self.plugin.emulator_gui.set_vibration_effect(effect_id, priority)
+            
+    def send_vibration_intensity(self, priority, intensity):
+        """Send a vibration intensity command to the device."""
+        priority = self._to_byte(priority)
+        intensity = self._to_byte(intensity)
+        
+        # Clips intensity to max from config
+        if intensity > self.max_vibration_intensity:
+            intensity = self.max_vibration_intensity
+
+        if self.hardware_connected:
+            # Send to hardware
+            pkt = self.uart_core.create_packet(self.H_VIBRATION_INTENSITY)
+            pkt.write_byte(priority)
+            pkt.write_byte(intensity)
+            self.uart_core.send_packet(pkt)
+                    
+        # Update emulator GUI
+        if self.plugin.emulator_gui:
+            self.plugin.emulator_gui.set_vibration_intensity(priority, intensity)
             
     def set_max_elevation_speed(self, speed):
         """Set the maximum elevation speed for the device."""

@@ -8,7 +8,8 @@ the depth map value at the current mouse position. No OpenCV window is displayed
 Protocol: 
 
 - Sends header 0x10 (elevation command as float)
-- Sends header 0x20 (vibration command when mouse is on screen border)
+- Sends header 0x20 (vibration effect command on screen border)
+- Sends header 0x21 (vibration intensity command)
 
 Usage: python screen_capture_test.py
 Requirements: pip install mss
@@ -30,7 +31,8 @@ SERIAL_BAUD_RATE = 460800
 # Header definitions
 H_PING = 0xFF
 H_ELEVATION = 0x10
-H_VIBRATION = 0x20
+H_VIBRATION_EFFECT = 0x20
+H_VIBRATION_INTENSITY = 0x21
 
 # Screen capture settings
 CAPTURE_INTERVAL = 0.0  # No artificial delay - run at maximum speed
@@ -38,9 +40,10 @@ MOUSE_CHECK_INTERVAL = 0.01  # Seconds between mouse position checks
 
 # Elevation scale factor
 elevation_scale = 0.5
-# Vibration parameters
-vibration_amplitude = 0.05  # Max amplitude
-vibration_freq = 100  # Frequency in Hz
+# Vibration parameters for new hardware protocol
+vibration_intensity = 13  # 0-255
+vibration_effect_id = 100  # 0-255 effect selector
+vibration_priority = 255
 # Depth map settings
 DOWNSAMPLE_FACTOR = 16  # Downsample by this factor for faster processing (higher = faster)
 ksize = 1  # Gaussian blur kernel size (1 = disabled for speed)
@@ -239,19 +242,23 @@ def main():
             # Send vibration command if exactly on border
             pos_on_border = current_pos[0] <= 0 or current_pos[0] >= screen_size[0] - 1 or current_pos[1] <= 0 or current_pos[1] >= screen_size[1] - 1
             if pos_on_border and (not on_border):
-                # Send vibration command
-                pkt = core.create_packet(H_VIBRATION)
-                pkt.write_float(vibration_amplitude)
-                pkt.write_float(vibration_freq)
-                pkt.write_int16(0)  # Duration 0 = continuous
+                # Send intensity command
+                pkt = core.create_packet(H_VIBRATION_INTENSITY)
+                pkt.write_byte(vibration_priority)
+                pkt.write_byte(vibration_intensity)
+                core.send_packet(pkt)
+
+                # Send effect command
+                pkt = core.create_packet(H_VIBRATION_EFFECT)
+                pkt.write_byte(vibration_priority)
+                pkt.write_byte(vibration_effect_id)
                 core.send_packet(pkt)
                 on_border = True
             elif (not pos_on_border) and on_border:
                 # Send vibration off command
-                pkt = core.create_packet(H_VIBRATION)
-                pkt.write_float(0)
-                pkt.write_float(0)
-                pkt.write_int16(0)
+                pkt = core.create_packet(H_VIBRATION_INTENSITY)
+                pkt.write_byte(vibration_priority)
+                pkt.write_byte(0)
                 core.send_packet(pkt)
                 on_border = False
             
