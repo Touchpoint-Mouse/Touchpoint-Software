@@ -37,6 +37,8 @@ class TouchpointEmulatorGUI:
         self.target_elevation = 0.0  # Target elevation value (0 to max_elevation)
         self.max_elevation = 180  # Maximum elevation value (default 180)
         self.max_elevation_speed = 255  # units per second
+        self.capture_region_size = (0, 0)
+        self.pixels_per_mm = None
         self.last_update_time = time.time()
         
         # Layer image storage - keyed by layer ID
@@ -117,6 +119,7 @@ class TouchpointEmulatorGUI:
             
             # Update connection status label based on current hardware state
             self._update_connection_status()
+            self._update_capture_region_status()
             
             # Handle window close
             self.frame.Bind(wx.EVT_CLOSE, self._on_close)
@@ -156,6 +159,13 @@ class TouchpointEmulatorGUI:
         hardware_sizer.Add(hardware_label, 0, wx.ALL, 5)
         hardware_sizer.Add(self.hardware_status_label, 0, wx.ALL, 5)
         status_sizer.Add(hardware_sizer, 0, wx.ALL, 5)
+
+        capture_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        capture_label = wx.StaticText(panel, label="Capture Region:")
+        self.capture_region_label = wx.StaticText(panel, label="0 x 0 px")
+        capture_sizer.Add(capture_label, 0, wx.ALL, 5)
+        capture_sizer.Add(self.capture_region_label, 0, wx.ALL, 5)
+        status_sizer.Add(capture_sizer, 0, wx.ALL, 5)
         
         main_sizer.Add(status_sizer, 0, wx.ALL | wx.EXPAND, 10)
         
@@ -277,6 +287,13 @@ class TouchpointEmulatorGUI:
             max_elevation: Maximum elevation value
         """
         self.max_elevation = max_elevation
+
+    def set_capture_region_size(self, width, height, pixels_per_mm=None):
+        """Set capture region size (in pixels) displayed by emulator GUI."""
+        self.capture_region_size = (int(width), int(height))
+        self.pixels_per_mm = pixels_per_mm
+        if self.is_open and self.frame:
+            wx.CallAfter(self._update_capture_region_status)
     
     def set_vibration_effect(self, effect_id, priority=1):
         """Log a vibration effect command from the hardware driver."""
@@ -448,6 +465,14 @@ class TouchpointEmulatorGUI:
         else:
             self.hardware_status_label.SetLabel("Disconnected")
             self.hardware_status_label.SetForegroundColour(wx.RED)
+
+    def _update_capture_region_status(self):
+        """Update capture region status label."""
+        width, height = self.capture_region_size
+        if self.pixels_per_mm is None:
+            self.capture_region_label.SetLabel(f"{width} x {height} px")
+        else:
+            self.capture_region_label.SetLabel(f"{width} x {height} px ({self.pixels_per_mm:.3f} px/mm)")
     
     def _populate_layer_tabs(self):
         """Populate the notebook with tabs for each layer."""
@@ -624,21 +649,27 @@ class TouchpointEmulatorGUI:
                 # Grayscale image - apply colormap
                 layer_for_display = layer_image
                 if layer_for_display.dtype != np.uint8:
-                    max_val = float(np.max(layer_for_display)) if layer_for_display.size > 0 else 0.0
-                    if max_val > 0:
-                        layer_for_display = np.clip((layer_for_display / max_val) * 255.0, 0, 255).astype(np.uint8)
+                    if np.issubdtype(layer_for_display.dtype, np.floating):
+                        max_elevation = float(self.max_elevation) if self.max_elevation else 0.0
+                        if max_elevation > 0:
+                            layer_for_display = np.clip((layer_for_display / max_elevation) * 255.0, 0, 255).astype(np.uint8)
+                        else:
+                            layer_for_display = np.clip(layer_for_display, 0, 255).astype(np.uint8)
                     else:
-                        layer_for_display = np.zeros_like(layer_for_display, dtype=np.uint8)
+                        layer_for_display = np.clip(layer_for_display, 0, 255).astype(np.uint8)
                 layer_colored = cv2.applyColorMap(layer_for_display, self.colormap_cv2)
             elif len(layer_image.shape) == 3 and layer_image.shape[2] == 1:
                 # Single channel as 3D array - apply colormap
                 layer_for_display = layer_image[:, :, 0]
                 if layer_for_display.dtype != np.uint8:
-                    max_val = float(np.max(layer_for_display)) if layer_for_display.size > 0 else 0.0
-                    if max_val > 0:
-                        layer_for_display = np.clip((layer_for_display / max_val) * 255.0, 0, 255).astype(np.uint8)
+                    if np.issubdtype(layer_for_display.dtype, np.floating):
+                        max_elevation = float(self.max_elevation) if self.max_elevation else 0.0
+                        if max_elevation > 0:
+                            layer_for_display = np.clip((layer_for_display / max_elevation) * 255.0, 0, 255).astype(np.uint8)
+                        else:
+                            layer_for_display = np.clip(layer_for_display, 0, 255).astype(np.uint8)
                     else:
-                        layer_for_display = np.zeros_like(layer_for_display, dtype=np.uint8)
+                        layer_for_display = np.clip(layer_for_display, 0, 255).astype(np.uint8)
                 layer_colored = cv2.applyColorMap(layer_for_display, self.colormap_cv2)
             else:
                 # Already color (BGR format from capture)

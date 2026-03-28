@@ -280,6 +280,15 @@ class RenderPipeline:
         """Cycle all layers to prepare for next frame."""
         for layer in self.get_layers():
             layer.cycle_state()
+
+    def set_depth_layer_constant_size(self, width=None, height=None):
+        """Set depth layer size from config-derived dimensions only.
+
+        Depth resolution is defined by hardware display resolution and layer multiplier
+        (via config.layer_dimensions['depth']) and must not be changed dynamically.
+        """
+        config_width, config_height = self.config.layer_dimensions['depth']
+        self.depth_layer.constant_size = (max(1, int(config_width)), max(1, int(config_height)))
     
     def dispatch_handlers(self):
         """Dispatch global handler events."""

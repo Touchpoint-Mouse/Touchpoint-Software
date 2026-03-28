@@ -54,6 +54,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Capture region configuration - centered on mouse with size from software config
         self.capture_region_width = capture_width
         self.capture_region_height = capture_height
+        self.capture_region_lock = threading.Lock()
         
         # Initialize all layers with starting region bounds
         initial_region = Rect(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
@@ -105,6 +106,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Initialize emulator with hardware settings
             self.emulator_gui.set_max_elevation(self.hardware.max_elevation)
             self.emulator_gui.set_elevation_speed(self.hardware.max_elevation_speed)
+            self.emulator_gui.set_capture_region_size(
+                self.capture_region_width,
+                self.capture_region_height,
+                pixels_per_mm=self.hardware.last_pixels_per_mm,
+            )
             
             # Start render thread
             self.render_thread = threading.Thread(target=self._render_thread, daemon=True)
@@ -214,6 +220,24 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def get_screen_size(self):
         """Get the full screen size as (width, height)."""
         return self.screen_size
+
+    def set_capture_region_size(self, width, height, pixels_per_mm=None):
+        """Dynamically update capture region size in pixels."""
+        width = max(1, int(round(width)))
+        height = max(1, int(round(height)))
+
+        resized = False
+        with self.capture_region_lock:
+            if width != self.capture_region_width or height != self.capture_region_height:
+                self.capture_region_width = width
+                self.capture_region_height = height
+                resized = True
+
+        if resized:
+            logMessage(f"Capture region resized to {width}x{height} px (ppm={pixels_per_mm})")
+
+        if self.emulator_gui:
+            self.emulator_gui.set_capture_region_size(width, height, pixels_per_mm=pixels_per_mm)
     
     def _render_thread(self):
         """Thread to track mouse position and trigger handlers."""
@@ -229,12 +253,16 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Route mouse enter/leave event transitions through render thread to avoid cross-thread conflicts.
             self._dispatch_mouse_object_transitions(current_pos)
             
+            with self.capture_region_lock:
+                capture_w = self.capture_region_width
+                capture_h = self.capture_region_height
+
             # Calculate new region centered on current mouse position
             new_region = Rect(
-                left=current_pos[0] - self.capture_region_width // 2,
-                top=current_pos[1] - self.capture_region_height // 2,
-                width=self.capture_region_width,
-                height=self.capture_region_height
+                left=current_pos[0] - capture_w // 2,
+                top=current_pos[1] - capture_h // 2,
+                width=capture_w,
+                height=capture_h
             )
             
             # Update region bounds and execute render cycle

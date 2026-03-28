@@ -89,10 +89,10 @@ class CaptureRenderer(Renderer):
         self.enabled = False
 
     def _camera_thread(self):
-        """Thread to continuously capture a large screen region with padding.
-        
+        """Thread to continuously capture a larger screen region using a scale factor.
+
         Captures a larger buffer than needed, so __call__() can crop to the exact region
-        requested by update_region_bounds. Creates mss instance in this thread since 
+        requested by update_region_bounds. Creates mss instance in this thread since
         mss uses thread-local storage.
         """
         # Create mss instance in this thread (required due to thread-local storage)
@@ -108,23 +108,31 @@ class CaptureRenderer(Renderer):
                 return
                 
             try:
-                # Get desired region and add padding for larger capture buffer
+                # Get desired region and expand by scale factor for larger capture buffer.
                 region = self.layer.current_region
-                
-                # Get padding from config (default to 100 pixels if not set)
-                padding = 100
+
+                scale_factor = 1.0
                 if self.plugin and hasattr(self.plugin, 'config'):
-                    padding = self.plugin.config.software.get('capture_padding', 100)
-                
-                # Create padded region using Rect
-                padded_region = region.pad(padding)
+                    scale_factor = float(getattr(self.plugin.config, 'capture_scale_factor', 1.0) or 1.0)
+
+                scaled_width = max(region.width, int(round(region.width * scale_factor)))
+                scaled_height = max(region.height, int(round(region.height * scale_factor)))
+                offset_x = (scaled_width - region.width) // 2
+                offset_y = (scaled_height - region.height) // 2
+
+                scaled_region = Rect(
+                    region.left - offset_x,
+                    region.top - offset_y,
+                    width=scaled_width,
+                    height=scaled_height,
+                )
                 
                 # Get screen bounds as Rect
                 screen_width, screen_height = self.plugin.get_screen_size()
                 screen_rect = Rect(0, 0, screen_width, screen_height)
                 
-                # Clamp padded region to screen bounds using intersection
-                capture_rect = padded_region.intersection(screen_rect)
+                # Clamp scaled region to screen bounds using intersection
+                capture_rect = scaled_region.intersection(screen_rect)
                 if not capture_rect:
                     # No valid capture area, skip this iteration
                     continue
@@ -519,7 +527,25 @@ class DepthRenderer(Renderer):
 class GraphicRenderer(Renderer):
     """Renderer that generates a depth map from graphic content under the mouse."""
 
-    def __init__(self, capture_layer, depth_layer, filter=None, ksize=7, invert=1, elevation_scale=0.5):
+    def __init__(
+        self,
+        capture_layer,
+        depth_layer,
+        filter=None,
+        ksize=7,
+        invert=1,
+        elevation_scale=0.5,
+        edge_enhance=True,
+        edge_weight=0.3,
+        edge_canny_low=60,
+        edge_canny_high=140,
+        edge_dilate_iterations=1,
+        edge_blur_ksize=0,
+        polarity_from_blobs=False,
+        polarity_hysteresis_frames=4,
+        blob_min_area=12,
+        blob_erode_iterations=1,
+    ):
         """Initialize with references to layers and processing parameters.
 
         Args:
@@ -536,6 +562,81 @@ class GraphicRenderer(Renderer):
         self.ksize = int(ksize)
         self.invert = -1 if invert == -1 else 1
         self.elevation_scale = float(elevation_scale)
+        self.edge_enhance = bool(edge_enhance)
+        self.edge_weight = max(0.0, float(edge_weight))
+        self.edge_canny_low = max(0, int(edge_canny_low))
+        self.edge_canny_high = max(0, int(edge_canny_high))
+        self.edge_dilate_iterations = max(0, int(edge_dilate_iterations))
+        self.edge_blur_ksize = max(0, int(edge_blur_ksize))
+        if self.edge_blur_ksize > 1 and self.edge_blur_ksize % 2 == 0:
+            self.edge_blur_ksize += 1
+        self.polarity_from_blobs = bool(polarity_from_blobs)
+        self.polarity_hysteresis_frames = max(1, int(polarity_hysteresis_frames))
+        self.blob_min_area = max(1, int(blob_min_area))
+        self.blob_erode_iterations = max(0, int(blob_erode_iterations))
+
+        # Hysteresis state for polarity switching.
+        self._effective_invert = (self.invert == -1)
+        self._pending_invert = self._effective_invert
+        self._pending_invert_frames = 0
+
+    def _count_blobs(self, binary_img):
+        """Count connected components above area threshold in a binary image."""
+        num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary_img, connectivity=8)
+        if num_labels <= 1:
+            return 0
+
+        count = 0
+        for label_idx in range(1, num_labels):
+            if int(stats[label_idx, cv2.CC_STAT_AREA]) >= self.blob_min_area:
+                count += 1
+        return count
+
+    def _decide_invert_from_blob_counts(self, gray_u8, bbox_rect):
+        """Decide desired polarity from white/black blob counts inside object bbox."""
+        left = max(0, min(gray_u8.shape[1], int(bbox_rect.left)))
+        top = max(0, min(gray_u8.shape[0], int(bbox_rect.top)))
+        right = max(0, min(gray_u8.shape[1], int(bbox_rect.right)))
+        bottom = max(0, min(gray_u8.shape[0], int(bbox_rect.bottom)))
+        if right <= left or bottom <= top:
+            return self._effective_invert
+
+        roi = gray_u8[top:bottom, left:right]
+        if roi.size == 0:
+            return self._effective_invert
+
+        _, white_binary = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        black_binary = cv2.bitwise_not(white_binary)
+
+        if self.blob_erode_iterations > 0:
+            erode_kernel = np.ones((3, 3), dtype=np.uint8)
+            white_binary = cv2.erode(white_binary, erode_kernel, iterations=self.blob_erode_iterations)
+            black_binary = cv2.erode(black_binary, erode_kernel, iterations=self.blob_erode_iterations)
+
+        white_blob_count = self._count_blobs(white_binary)
+        black_blob_count = self._count_blobs(black_binary)
+
+        # Invert when dark structure is more fragmented than bright structure.
+        return black_blob_count > white_blob_count
+
+    def _update_polarity_hysteresis(self, desired_invert):
+        """Apply temporal hysteresis so polarity changes only after consistent votes."""
+        if desired_invert == self._effective_invert:
+            self._pending_invert = desired_invert
+            self._pending_invert_frames = 0
+            return self._effective_invert
+
+        if desired_invert != self._pending_invert:
+            self._pending_invert = desired_invert
+            self._pending_invert_frames = 1
+            return self._effective_invert
+
+        self._pending_invert_frames += 1
+        if self._pending_invert_frames >= self.polarity_hysteresis_frames:
+            self._effective_invert = desired_invert
+            self._pending_invert_frames = 0
+
+        return self._effective_invert
 
     def _zero_depth(self):
         """Clear depth layer when no valid graphic target is active."""
@@ -585,31 +686,100 @@ class GraphicRenderer(Renderer):
 
             depth_map = cv2.cvtColor(capture_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
-            ksize = self.ksize if self.ksize % 2 == 1 else self.ksize + 1
-            if ksize > 1:
-                depth_map = cv2.GaussianBlur(depth_map, (ksize, ksize), 0)
+            # Build a depth-corresponding working grid that still preserves extra capture context.
+            # This yields a larger working map when capture scale_factor > 1, then final crop
+            # returns to the actual depth layer size.
+            if self.plugin and hasattr(self.plugin, 'config'):
+                target_width, target_height = self.plugin.config.layer_dimensions['depth']
+            else:
+                target_width, target_height = self.depth_layer.constant_size if self.depth_layer.constant_size else (region.width, region.height)
+            target_width = max(1, int(target_width))
+            target_height = max(1, int(target_height))
+            capture_to_depth_scale_x = region.width / target_width if target_width > 0 else 1.0
+            capture_to_depth_scale_y = region.height / target_height if target_height > 0 else 1.0
+            work_width = max(target_width, int(round(target_width * capture_to_depth_scale_x)))
+            work_height = max(target_height, int(round(target_height * capture_to_depth_scale_y)))
+
+            if depth_map.shape[1] != work_width or depth_map.shape[0] != work_height:
+                depth_map = cv2.resize(depth_map, (work_width, work_height), interpolation=cv2.INTER_AREA)
+
+            edge_input_u8 = np.clip(depth_map, 0, 255).astype(np.uint8)
+            if self.edge_blur_ksize > 1:
+                edge_input_u8 = cv2.GaussianBlur(edge_input_u8, (self.edge_blur_ksize, self.edge_blur_ksize), 0)
+
+            # Scale Gaussian kernel with the capture-to-depth resolution ratio.
+            ratio_x = region.width / target_width if target_width > 0 else 1.0
+            ratio_y = region.height / target_height if target_height > 0 else 1.0
+            resolution_ratio = max(1.0, ratio_x, ratio_y)
+            scaled_kernel = int(round(self.ksize * resolution_ratio))
+            if scaled_kernel < 1:
+                scaled_kernel = 1
+            if scaled_kernel % 2 == 0:
+                scaled_kernel += 1
+
+            if scaled_kernel > 1:
+                depth_map = cv2.GaussianBlur(depth_map, (scaled_kernel, scaled_kernel), 0)
+
+            gray_u8 = np.clip(depth_map, 0, 255).astype(np.uint8)
+
+            # Blob-count polarity decision is confined to the hovered object's bbox.
+            bbox_local = image_region.global_to_local(region.top_left())
+            bbox_left = int(round(bbox_local.left * work_width / region.width))
+            bbox_top = int(round(bbox_local.top * work_height / region.height))
+            bbox_right = int(round(bbox_local.right * work_width / region.width))
+            bbox_bottom = int(round(bbox_local.bottom * work_height / region.height))
+            bbox_left = max(0, min(work_width, bbox_left))
+            bbox_top = max(0, min(work_height, bbox_top))
+            bbox_right = max(0, min(work_width, bbox_right))
+            bbox_bottom = max(0, min(work_height, bbox_bottom))
+            bbox_scaled = Rect(bbox_left, bbox_top, right=bbox_right, bottom=bbox_bottom)
+
+            effective_invert = (self.invert == -1)
+            if self.polarity_from_blobs:
+                desired_invert = self._decide_invert_from_blob_counts(gray_u8, bbox_scaled)
+                effective_invert = self._update_polarity_hysteresis(desired_invert)
 
             depth_map = depth_map / 255.0
-            if self.invert == -1:
+            if effective_invert:
                 depth_map = 1.0 - depth_map
+
+            if self.edge_enhance and self.edge_weight > 0.0:
+                edges = cv2.Canny(edge_input_u8, self.edge_canny_low, self.edge_canny_high)
+                if self.edge_dilate_iterations > 0:
+                    kernel = np.ones((3, 3), dtype=np.uint8)
+                    edges = cv2.dilate(edges, kernel, iterations=self.edge_dilate_iterations)
+                edge_map = edges.astype(np.float32) / 255.0
+                depth_map = depth_map + (edge_map * self.edge_weight)
 
             max_elevation = float(self.plugin.hardware.get_max_elevation())
             depth_map = depth_map * self.elevation_scale * max_elevation
+            depth_map = np.clip(depth_map, 0.0, max_elevation)
 
             # Keep depth only inside the hovered image bounding box; suppress background.
-            bbox_local = image_region.global_to_local(region.top_left())
             mask = np.zeros_like(depth_map, dtype=bool)
-            mask[bbox_local.top:bbox_local.bottom, bbox_local.left:bbox_local.right] = True
+            mask[bbox_top:bbox_bottom, bbox_left:bbox_right] = True
             depth_map[~mask] = 0.0
 
-            padding = self.plugin.config.capture_padding
-            depth_for_layer = depth_map
-            if padding > 0:
-                h, w = depth_for_layer.shape[:2]
-                if h > 2 * padding and w > 2 * padding:
-                    depth_for_layer = depth_for_layer[padding:h-padding, padding:w-padding]
+            # Crop to hardware-equivalent center region (capture_size / scale_factor), then
+            # resize to fixed depth resolution.
+            capture_scale_factor = 1.0
+            if self.plugin and hasattr(self.plugin, 'config'):
+                capture_scale_factor = float(getattr(self.plugin.config, 'capture_scale_factor', 1.0) or 1.0)
 
-            self.depth_layer.update_image(depth_for_layer.astype(np.float32, copy=False))
+            crop_width = max(1, int(round(work_width / max(1.0, capture_scale_factor))))
+            crop_height = max(1, int(round(work_height / max(1.0, capture_scale_factor))))
+            crop_left = max(0, (work_width - crop_width) // 2)
+            crop_top = max(0, (work_height - crop_height) // 2)
+            crop_right = min(work_width, crop_left + crop_width)
+            crop_bottom = min(work_height, crop_top + crop_height)
+            depth_map = depth_map[crop_top:crop_bottom, crop_left:crop_right]
+
+            # Resize cropped hardware-equivalent region to the configured depth resolution.
+            if depth_map.shape[:2] != (target_height, target_width):
+                depth_map = cv2.resize(depth_map, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+            # Final map is now in depth-layer resolution.
+            self.depth_layer.update_image(depth_map.astype(np.float32, copy=False))
 
         except Exception as e:
             logMessage(f"[ERROR] GraphicRenderer failed: {e}")
@@ -655,17 +825,6 @@ class ObjectDepthRenderer(Renderer):
                 # Use linear scaling: depth = (label / max_label) * max_elevation
                 mask = object_img > 0  # Non-background pixels
                 depth_map[mask] = (object_img[mask].astype(np.float32) / max_label) * max_elevation
-            
-            # Get padding from config to crop to hardware area
-            padding = self.plugin.config.capture_padding
-            
-            # Crop to hardware area (remove padding on all sides)
-            if padding > 0:
-                h, w = depth_map.shape[:2]
-                if h > 2*padding and w > 2*padding:
-                    depth_map = depth_map[padding:h-padding, padding:w-padding]
-                else:
-                    logMessage(f"[ObjectDepthRenderer] Warning: depth map too small to crop padding {padding}")
             
             # Write to depth layer
             self.depth_layer.update_image(depth_map)

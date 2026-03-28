@@ -29,9 +29,9 @@ class TouchpointConfig:
         
         # Compute derived values (cached for performance)
         self.layer_dimensions = self._calculate_layer_dimensions()
-        self.hardware_dimensions = self._calculate_hardware_dimensions()  # Hardware area without padding
-        self.capture_dimensions = self._calculate_capture_dimensions()  # Capture area with padding
-        self.capture_padding = self.software['capture_region'].get('padding', 0)
+        self.hardware_dimensions = self._calculate_hardware_dimensions()  # Hardware area without scale expansion
+        self.capture_scale_factor = self._get_capture_scale_factor()
+        self.capture_dimensions = self._calculate_capture_dimensions()  # Capture area with scale expansion
         
         # Log configuration summary
         self._log_configuration()
@@ -71,16 +71,24 @@ class TouchpointConfig:
                     "elevation": 16,
                     "elevation_speed": 17,
                     "vibration_effect": 32,
-                    "vibration_intensity": 33
+                    "vibration_intensity": 33,
+                    "pixels_per_mm": 48
                 },
                 "serial": {"port": "COM6", "baud_rate": 460800},
-                "display": {"resolution": 36.0, "aspect_ratio": 0.5},
+                "display": {
+                    "resolution": 36.0,
+                    "aspect_ratio": 0.5,
+                    "width_mm": 40.0,
+                    "height_mm": 64.0,
+                    "initial_pixels_per_mm": 2.0
+                },
                 "elevation": {"max_elevation": 180, "max_elevation_speed": 180},
                 "vibration": {"max_intensity": 127},
                 "command_enable": {
                     "elevation": True,
                     "vibration_effect": True,
-                    "vibration_intensity": True
+                    "vibration_intensity": True,
+                    "dynamic_capture_resize": True
                 }
             }
     
@@ -98,7 +106,7 @@ class TouchpointConfig:
             logMessage(f"[ERROR] Failed to load software config: {e}")
             # Return defaults
             return {
-                "capture_region": {"area": 10000, "aspect_ratio": 1.0},
+                "capture_region": {"scale_factor": 1.0},
                 "layer_multipliers": {"depth": 4.0, "texture": 1.0},
                 "threading": {"capture": 0.01, "render": 0.01},
                 "renderers": {
@@ -118,13 +126,13 @@ class TouchpointConfig:
         try:
             # Validate hardware config
             assert self.hardware['display']['resolution'] > 0, "Hardware resolution must be positive"
-            assert self.hardware['display']['aspect_ratio'] > 0, "Hardware aspect ratio must be positive"
+            assert self._get_display_aspect_ratio() > 0, "Hardware aspect ratio must be positive"
+            assert float(self.hardware['display'].get('width_mm', 0.0) or 0.0) > 0, "Display width_mm must be positive"
+            assert float(self.hardware['display'].get('height_mm', 0.0) or 0.0) > 0, "Display height_mm must be positive"
+            assert self._get_initial_pixels_per_mm() > 0, "Initial pixels_per_mm must be positive"
+            assert self._get_capture_scale_factor() >= 1.0, "Capture scale_factor must be >= 1.0"
             assert self.hardware['elevation']['max_elevation'] > 0, "Max elevation must be positive"
             assert self.hardware['elevation']['max_elevation_speed'] > 0, "Max elevation speed must be positive"
-            
-            # Validate software config
-            assert self.software['capture_region']['area'] > 0, "Capture area must be positive"
-            assert self.software['capture_region']['aspect_ratio'] > 0, "Capture aspect ratio must be positive"
             
             for layer_name, multiplier in self.software['layer_multipliers'].items():
                 assert multiplier > 0, f"Layer multiplier for '{layer_name}' must be positive"
@@ -135,6 +143,25 @@ class TouchpointConfig:
         except AssertionError as e:
             logMessage(f"[ERROR] Configuration validation failed: {e}")
             raise
+
+    def _get_display_aspect_ratio(self):
+        """Get display aspect ratio, preferring physically defined dimensions in mm."""
+        display = self.hardware.get('display', {})
+        width_mm = float(display.get('width_mm', 0.0) or 0.0)
+        height_mm = float(display.get('height_mm', 0.0) or 0.0)
+        if width_mm > 0 and height_mm > 0:
+            return width_mm / height_mm
+        return float(display.get('aspect_ratio', 1.0) or 1.0)
+
+    def _get_initial_pixels_per_mm(self):
+        """Get startup pixels/mm used to size the initial capture region before telemetry updates arrive."""
+        display = self.hardware.get('display', {})
+        return float(display.get('initial_pixels_per_mm', 2.0) or 2.0)
+
+    def _get_capture_scale_factor(self):
+        """Get capture-region scale factor relative to hardware dimensions."""
+        capture_cfg = self.software.get('capture_region', {})
+        return float(capture_cfg.get('scale_factor', 1.0) or 1.0)
     
     def _calculate_layer_dimensions(self):
         """Calculate layer dimensions based on hardware and software configuration.
@@ -143,7 +170,7 @@ class TouchpointConfig:
             dict: Dictionary mapping layer names to (width, height) tuples
         """
         hw_resolution = self.hardware['display']['resolution']
-        hw_aspect_ratio = self.hardware['display']['aspect_ratio']
+        hw_aspect_ratio = self._get_display_aspect_ratio()
         
         multipliers = self.software['layer_multipliers']
         
@@ -163,33 +190,36 @@ class TouchpointConfig:
         return dimensions
     
     def _calculate_hardware_dimensions(self):
-        """Calculate hardware area dimensions (without padding) from area and hardware aspect ratio.
+        """Calculate hardware area dimensions (without padding) from physical size and initial pixels/mm.
         
         Returns:
             tuple: (width, height) in pixels
         """
-        capture_area = self.software['capture_region']['area']
-        hardware_aspect_ratio = self.hardware['display']['aspect_ratio']
-        
-        # area = width * height, aspect_ratio = width / height
-        # height = sqrt(area / aspect_ratio), width = height * aspect_ratio
-        hardware_height = int(math.sqrt(capture_area / hardware_aspect_ratio))
-        hardware_width = int(hardware_height * hardware_aspect_ratio)
+        display = self.hardware.get('display', {})
+        width_mm = float(display.get('width_mm', 0.0) or 0.0)
+        height_mm = float(display.get('height_mm', 0.0) or 0.0)
+        initial_pixels_per_mm = self._get_initial_pixels_per_mm()
+
+        hardware_width = max(1, int(round(width_mm * initial_pixels_per_mm)))
+        hardware_height = max(1, int(round(height_mm * initial_pixels_per_mm)))
         
         return (hardware_width, hardware_height)
     
     def _calculate_capture_dimensions(self):
-        """Calculate capture region dimensions with padding from area and aspect ratio.
+        """Calculate capture region dimensions from hardware size and scale factor.
         
         Returns:
-            tuple: (width, height) in pixels (includes padding on all sides)
+            tuple: (width, height) in pixels
         """
+        display = self.hardware.get('display', {})
+        width_mm = float(display.get('width_mm', 0.0) or 0.0)
+        height_mm = float(display.get('height_mm', 0.0) or 0.0)
+        initial_pixels_per_mm = self._get_initial_pixels_per_mm()
         hardware_width, hardware_height = self.hardware_dimensions
-        padding = self.software['capture_region'].get('padding', 0)
-        
-        # Add padding on all sides (left, right, top, bottom)
-        capture_width = hardware_width + (2 * padding)
-        capture_height = hardware_height + (2 * padding)
+        scale_factor = self.capture_scale_factor
+
+        capture_width = max(hardware_width, int(math.ceil(width_mm * initial_pixels_per_mm * scale_factor)))
+        capture_height = max(hardware_height, int(math.ceil(height_mm * initial_pixels_per_mm * scale_factor)))
         
         return (capture_width, capture_height)
     
@@ -197,10 +227,11 @@ class TouchpointConfig:
         """Log configuration summary for debugging."""
         hw_width, hw_height = self.hardware_dimensions
         cap_width, cap_height = self.capture_dimensions
-        padding = self.capture_padding
+        scale_factor = self.capture_scale_factor
+        initial_pixels_per_mm = self._get_initial_pixels_per_mm()
         logMessage(f"Configuration loaded:")
-        logMessage(f"  Hardware area: {hw_width}x{hw_height} pixels (area={self.software['capture_region']['area']}, aspect={self.hardware['display']['aspect_ratio']})")
-        logMessage(f"  Capture region: {cap_width}x{cap_height} pixels (with {padding}px padding on all sides)")
+        logMessage(f"  Hardware area: {hw_width}x{hw_height} pixels (display={self.hardware['display']['width_mm']}x{self.hardware['display']['height_mm']} mm, ppm={initial_pixels_per_mm:.3f}, aspect={self._get_display_aspect_ratio():.4f})")
+        logMessage(f"  Capture region: {cap_width}x{cap_height} pixels (scale_factor={scale_factor:.3f})")
         
         for layer_name, (w, h) in self.layer_dimensions.items():
             area = w * h
@@ -214,7 +245,7 @@ class TouchpointConfig:
             tuple: (mesh_height, mesh_width) in texture points
         """
         hw_resolution = self.hardware['display']['resolution']
-        hw_aspect_ratio = self.hardware['display']['aspect_ratio']
+        hw_aspect_ratio = self._get_display_aspect_ratio()
         
         mesh_height = int(math.sqrt(hw_resolution / hw_aspect_ratio))
         mesh_width = int(mesh_height * hw_aspect_ratio)
