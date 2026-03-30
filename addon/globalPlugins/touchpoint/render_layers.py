@@ -531,6 +531,7 @@ class GraphicRenderer(Renderer):
         self,
         capture_layer,
         depth_layer,
+        texture_layer=None,
         filter=None,
         ksize=7,
         invert=1,
@@ -558,6 +559,7 @@ class GraphicRenderer(Renderer):
         """
         self.capture_layer = capture_layer
         self.depth_layer = depth_layer
+        self.texture_layer = texture_layer
         self.filter = filter if filter is not None else GraphicFilter()
         self.ksize = int(ksize)
         self.invert = -1 if invert == -1 else 1
@@ -639,8 +641,10 @@ class GraphicRenderer(Renderer):
         return self._effective_invert
 
     def _zero_depth(self):
-        """Clear depth layer when no valid graphic target is active."""
+        """Clear depth/texture layers when no valid graphic target is active."""
         self.depth_layer.update_image(np.zeros((0, 0), dtype=np.float32))
+        if self.texture_layer is not None:
+            self.texture_layer.update_image(np.zeros((0, 0), dtype=np.uint8))
 
     def __call__(self):
         """Generate depth map from capture image and write it to depth layer."""
@@ -743,6 +747,7 @@ class GraphicRenderer(Renderer):
             if effective_invert:
                 depth_map = 1.0 - depth_map
 
+            edge_map = np.zeros_like(depth_map, dtype=np.float32)
             if self.edge_enhance and self.edge_weight > 0.0:
                 edges = cv2.Canny(edge_input_u8, self.edge_canny_low, self.edge_canny_high)
                 if self.edge_dilate_iterations > 0:
@@ -773,17 +778,77 @@ class GraphicRenderer(Renderer):
             crop_right = min(work_width, crop_left + crop_width)
             crop_bottom = min(work_height, crop_top + crop_height)
             depth_map = depth_map[crop_top:crop_bottom, crop_left:crop_right]
+            edge_map = edge_map[crop_top:crop_bottom, crop_left:crop_right]
 
             # Resize cropped hardware-equivalent region to the configured depth resolution.
             if depth_map.shape[:2] != (target_height, target_width):
                 depth_map = cv2.resize(depth_map, (target_width, target_height), interpolation=cv2.INTER_AREA)
+            if edge_map.shape[:2] != (target_height, target_width):
+                edge_map = cv2.resize(edge_map, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
             # Final map is now in depth-layer resolution.
             self.depth_layer.update_image(depth_map.astype(np.float32, copy=False))
+            if self.texture_layer is not None:
+                texture_edges = np.clip(edge_map * 255.0, 0, 255).astype(np.uint8)
+                self.texture_layer.update_image(texture_edges)
 
         except Exception as e:
             logMessage(f"[ERROR] GraphicRenderer failed: {e}")
             logMessage(traceback.format_exc())
+
+
+class TextureVibrationRenderer(Renderer):
+    """Renderer that converts edge texture activity into realtime vibration intensity."""
+
+    def __init__(self, texture_layer, priority=200, intensity_scale=1.0, min_intensity=0, max_intensity=127, smoothing_alpha=0.35):
+        self.texture_layer = texture_layer
+        self.priority = max(0, min(255, int(priority)))
+        self.intensity_scale = max(0.0, float(intensity_scale))
+        self.min_intensity = max(0, min(255, int(min_intensity)))
+        self.max_intensity = max(0, min(255, int(max_intensity)))
+        self.smoothing_alpha = min(1.0, max(0.0, float(smoothing_alpha)))
+        self._smoothed_intensity = 0.0
+        self._last_mouse_pos = None
+
+    def __call__(self):
+        try:
+            if not self.plugin or not self.plugin.hardware:
+                return
+
+            mouse_pos = self.plugin.get_mouse_position() if hasattr(self.plugin, 'get_mouse_position') else None
+            if mouse_pos == self._last_mouse_pos:
+                self._smoothed_intensity *= (1.0 - self.smoothing_alpha)
+                self.plugin.hardware.send_vibration_intensity(self.priority, 0)
+                return
+            self._last_mouse_pos = mouse_pos
+
+            texture_img = self.texture_layer.get_image()
+            if texture_img.size == 0:
+                self._smoothed_intensity *= (1.0 - self.smoothing_alpha)
+                self.plugin.hardware.send_vibration_intensity(self.priority, 0)
+                return
+
+            if len(texture_img.shape) == 3 and texture_img.shape[2] > 1:
+                texture_gray = cv2.cvtColor(texture_img, cv2.COLOR_BGR2GRAY)
+            else:
+                texture_gray = texture_img
+
+            texture_gray = texture_gray.astype(np.float32, copy=False)
+            mean_val = float(np.mean(texture_gray))
+            p90_val = float(np.percentile(texture_gray, 90))
+            activity = (0.7 * p90_val) + (0.3 * mean_val)
+
+            raw_intensity = activity * self.intensity_scale
+            raw_intensity = max(self.min_intensity, min(self.max_intensity, raw_intensity))
+            self._smoothed_intensity = (
+                (1.0 - self.smoothing_alpha) * self._smoothed_intensity
+                + self.smoothing_alpha * raw_intensity
+            )
+
+            intensity = int(round(self._smoothed_intensity))
+            self.plugin.hardware.send_vibration_intensity(self.priority, intensity)
+        except Exception as e:
+            logMessage(f"[ERROR] TextureVibrationRenderer failed: {e}")
 
 class ObjectDepthRenderer(Renderer):
     """Renderer that reads from object layer and writes scaled depth to depth layer."""

@@ -14,6 +14,7 @@ from .render_layers import (
     ObjectRenderer,
     DepthRenderer,
     GraphicRenderer,
+    TextureVibrationRenderer,
     ObjectDepthRenderer,
     ElevationRenderer
 )
@@ -62,7 +63,7 @@ class RenderPipeline:
         self.capture_layer = RenderLayer(id="capture", dtype=np.uint8, num_channels=3)  # BGR color
         self.object_layer = ObjectLayer(id="object", max_depth=max_depth, labels_per_depth=labels_per_depth)  # Dynamic size follows capture region
         self.depth_layer = RenderLayer(id="depth", dtype=np.float32, constant_size=layer_dims['depth'], num_channels=1)  # Grayscale elevation values
-        self.texture_layer = RenderLayer(id="texture", dtype=np.uint8, constant_size=layer_dims['texture'])  # BGR color
+        self.texture_layer = RenderLayer(id="texture", dtype=np.uint8, constant_size=layer_dims['depth'], num_channels=1)  # Edge texture aligned to depth resolution
         
         # Set plugin reference for all layers
         for layer in self.get_layers():
@@ -92,6 +93,7 @@ class RenderPipeline:
             GraphicRenderer,
             self.capture_layer,
             self.depth_layer,
+            self.texture_layer,
         )
         self.object_depth_renderer = self._create_renderer_instance(
             "object_depth_renderer",
@@ -103,6 +105,11 @@ class RenderPipeline:
             "elevation_renderer",
             ElevationRenderer,
             self.depth_layer,
+        )
+        self.texture_vibration_renderer = self._create_renderer_instance(
+            "texture_vibration_renderer",
+            TextureVibrationRenderer,
+            self.texture_layer,
         )
         
         # Set plugin reference for all renderers
@@ -238,6 +245,7 @@ class RenderPipeline:
             self.capture_renderer,
             #self.object_renderer,
             self.graphic_renderer,
+            self.texture_vibration_renderer,
             # self.depth_renderer,  # Temporarily disabled
             # self.object_depth_renderer,  # TEMPORARILY DISABLED
             self.elevation_renderer
