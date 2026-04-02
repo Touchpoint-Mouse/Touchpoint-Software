@@ -28,48 +28,111 @@ Primary implementation files:
 - addon/globalPlugins/touchpoint/hardware_config.json
 
 ## High-Level Architecture
-The runtime has four cooperating subsystems:
+The runtime is built from reusable class families rather than a single monolithic pipeline.
 
-1. Plugin orchestration
-- GlobalPlugin owns lifecycle, threads, region updates, and dispatch order.
+1. Orchestration classes
+- GlobalPlugin owns lifecycle and threads.
+- RenderPipeline composes layers, renderers, handlers, and managers.
 
-2. Render pipeline
-- Layer graph (capture, object, depth, texture).
-- Renderer graph (capture -> graphic -> texture vibration -> elevation).
+2. Data classes
+- RenderLayer is the base image/region container.
+- ObjectLayer extends semantic labeling behavior on top of RenderLayer.
 
-3. Event/handler pipeline
-- Object handlers and global handlers trigger explicit effects.
+3. Behavior classes
+- Renderer subclasses transform layers into new layer state or hardware commands.
+- Filter subclasses decide whether handlers should match.
+- Effect subclasses define what command behavior happens when events fire.
 
-4. Hardware interface
-- Songbird UART transport.
-- Prioritized command emission for elevation and vibration.
+4. Transport/config classes
+- HardwareDriver handles command arbitration and protocol I/O.
+- TouchpointConfig computes dimensions and exposes config-derived parameters.
 
 ## Threading Model
-### NVDA event thread
-- Receives NVDA object events.
-- Forwards object events into ObjectHandlerManager.
+Execution is distributed across class-owned threads:
+- GlobalPlugin render thread: drives per-frame orchestration and calls RenderPipeline.
+- CaptureRenderer camera thread: continuously acquires capture buffers.
+- HardwareDriver health thread: monitors hardware connection/ping state.
+- NVDA event thread: forwards object events into ObjectHandlerManager.
 
-### Render thread
-- Implemented in GlobalPlugin._render_thread.
-- Responsibilities per loop:
-  1. Read cursor position.
-  2. Dispatch mouse enter/leave transitions on object handlers.
-  3. Compute new mouse-centered capture region.
-  4. Update all layer region bounds.
-  5. Execute renderers in configured order.
-  6. Push images to emulator if open.
-  7. Cycle layer state.
-  8. Dispatch global handlers.
-  9. Cycle hardware state machine.
+This keeps event detection, frame rendering, and hardware health isolated while sharing state via plugin/pipeline objects.
 
-### Capture camera thread
-- Owned by CaptureRenderer.
-- Continuously captures a larger screen buffer using capture scale factor.
-- Render step crops from this buffer into the exact requested region.
+## Core Class Structure
+### Filters
+Filters answer: should this handler apply here?
 
-### Hardware health thread
-- Owned by HardwareDriver.
-- Periodically pings device and updates connection status.
+- ObjectFilter: base class with matches(plugin, obj).
+- ComboObjectFilter: include/exclude composition for object filters.
+- GraphicFilter: built-in object filter for image/graphic-like targets.
+- GlobalFilter: base class with matches(plugin).
+- ComboGlobalFilter: include/exclude composition for global filters.
+
+Typical usage: ObjectHandler(filter=SomeObjectFilter(), effects={...}).
+
+### Effects
+Effects answer: what action should happen when an event fires?
+
+- Effect: base callable protocol (__call__(handler, obj=None, **kwargs)).
+- ComboEffect: executes multiple effects in sequence.
+- VibrationEffect: sends protocol vibration effect IDs.
+- VibrationIntensityEffect: sends direct vibration intensity values.
+- GlobalElevationEffect: sets absolute elevation with priority.
+- RelativeElevationEffect: adds elevation offset.
+
+Effects are transport-agnostic at call sites: handlers invoke effects, and effects route commands through handler.plugin.hardware.
+
+### Handlers and Managers
+Handlers bind events to effects; managers dispatch handlers.
+
+- ObjectHandler: owns object filter + event-to-effect mapping.
+- GlobalHandler: owns global filter + trigger_event API.
+- ScreenBorderHandler: concrete global handler for border enter/leave.
+- ObjectHandlerManager: event fan-out and mouse transition dispatch.
+- GlobalHandlerManager: per-frame global handler dispatch.
+
+Key pattern: filters decide applicability, then effects produce haptic behavior.
+
+### Layers
+Layers store frame data and region state.
+
+- RenderLayer: base image container with current/previous image and region.
+- SemanticLayer: semantic label-oriented layer base.
+- ObjectLayer: semantic labels, label map, and depth allocation helpers.
+
+Current layers in this project:
+- capture layer: dynamic BGR screen image in the current capture region.
+- object layer: dynamic semantic label map of detected/queried UI objects.
+- depth layer: fixed-size float32 elevation map.
+- texture layer: fixed-size uint8 edge/texture map aligned to depth.
+
+### Renderers
+Renderers consume layers (and plugin state) and produce new layer/hardware output.
+
+- Renderer: base class with initialize(), __call__(), set_plugin().
+- CaptureRenderer: refreshes capture layer from camera-thread buffers.
+- ObjectRenderer: populates object layer from sampled object queries.
+- DepthRenderer: generic depth-from-capture path.
+- GraphicRenderer: graphic-focused depth + edge extraction path.
+- TextureVibrationRenderer: texture activity to vibration intensity.
+- ObjectDepthRenderer: object-semantic depth composition path.
+- ElevationRenderer: converts depth center sample to elevation command.
+
+Current active renderer order:
+1. CaptureRenderer
+2. GraphicRenderer
+3. TextureVibrationRenderer
+4. ElevationRenderer
+
+Current renderer blurbs:
+- CaptureRenderer: provides centered capture data each frame.
+- GraphicRenderer: writes depth and texture layers from graphic targets.
+- TextureVibrationRenderer: maps texture activity to vibration intensity, with stationary off behavior.
+- ElevationRenderer: maps center depth to global elevation.
+
+### Orchestration and Transport
+- RenderPipeline: composition root for layers/renderers/handlers and frame execution order.
+- GlobalPlugin: owns lifecycle, shared state, render loop, and event hookups.
+- HardwareDriver: command gating, priority handling, UART packet emission, emulator mirroring.
+- TouchpointConfig: computes derived dimensions and exposes runtime configuration.
 
 ## Configuration Model
 ## Hardware config
@@ -114,103 +177,25 @@ When enabled and a pixels_per_mm packet arrives:
 - Plugin updates capture region size.
 - Depth resolution does not change dynamically.
 
-## Render Layers
-## capture layer
-- Dynamic size following capture region.
-- BGR image.
-
-## object layer
-- Dynamic semantic/object label map.
-- Maintains label hierarchy and depth allocation.
-
-## depth layer
-- Float32 grayscale elevation map.
-- Constant size from config layer_dimensions['depth'].
-
-## texture layer
-- UInt8 single-channel edge texture.
-- Constant size aligned to depth layer resolution.
-
-## Renderer Graph
-Current execution order:
-1. CaptureRenderer
-2. GraphicRenderer
-3. TextureVibrationRenderer
-4. ElevationRenderer
-
-ObjectRenderer, DepthRenderer, and ObjectDepthRenderer exist but are currently not in the active execution list.
-
-## CaptureRenderer
-- Uses a scale-factor-expanded capture rect around the current region.
-- Crops intersection into exact region dimensions every frame.
-- Provides stable, centered context for downstream processing.
-
-## GraphicRenderer
-Inputs:
-- capture_layer
-- depth_layer
-- texture_layer
-- current mouse object filtered by GraphicFilter
-
-Pipeline:
-1. Validate active graphic target under mouse.
-2. Convert capture BGR to grayscale float map.
-3. Build working grid corresponding to capture/depth relationship.
-4. Optional smoothing with scale-aware kernel.
-5. Optional polarity decision (currently configurable and default-disabled).
-6. Normalize to 0..1 and optional invert.
-7. Edge extraction (Canny + optional dilation) and edge accentuation into depth.
-8. Scale by max elevation and elevation_scale.
-9. Mask output outside hovered object bbox.
-10. Crop to hardware-equivalent center region:
-- crop size = work_size / capture_scale_factor
-11. Resize cropped region to fixed depth resolution.
-12. Write:
-- depth map to depth layer
-- edge map to texture layer
-
-Behavioral guarantees:
-- Depth resolution is fixed by config.
-- Capture scale increases context window, not final depth map resolution.
-
-## TextureVibrationRenderer
-Purpose:
-- Convert edge activity in texture layer into real-time vibration intensity.
-
-Inputs:
-- texture_layer image at depth resolution.
-- mouse movement state from plugin.get_mouse_position().
-
-Behavior:
-- If mouse has not moved since last frame:
-  - sends vibration intensity 0 (off command).
-- If texture is empty:
-  - sends vibration intensity 0.
-- If moving with valid texture:
-  - computes activity from weighted p90 + mean edge intensity.
-  - applies intensity_scale and min/max clamp.
-  - applies exponential smoothing (smoothing_alpha).
-  - sends send_vibration_intensity(priority, intensity).
-
-## ElevationRenderer
-- Reads center pixel of depth layer.
-- Sends set_global_elevation(center_value, priority).
-
 ## Event and Effect System
-Object handlers and global handlers remain active alongside renderers.
+Event processing is intentionally class-driven:
 
-### ObjectHandler usage
-- Graphic enter/leave events with vibration effects and elevation reset behavior.
-- Per-handler entered-object state avoids oscillation.
+1. Source event enters a manager.
+- NVDA object events go to ObjectHandlerManager.dispatch_event(...).
+- Global periodic checks run through GlobalHandlerManager.dispatch_events().
 
-### GlobalHandler usage
-- Screen border enter/leave vibration intensity commands.
+2. Handler matching happens through a filter.
+- ObjectHandler calls filter.matches(plugin, obj).
+- GlobalHandler calls filter.matches(plugin).
 
-Effects available include:
-- VibrationEffect (effect IDs)
-- VibrationIntensityEffect (priority + scalar intensity)
-- GlobalElevationEffect
-- ComboEffect
+3. Effect execution happens through event keys.
+- Handler maps event names (enter, leave, gainFocus, border_enter, etc.) to Effect instances.
+- Effect __call__ implementations send commands via HardwareDriver.
+
+4. Mouse transition support is built into ObjectHandlerManager.
+- Per-handler entered-object state and bbox exit checks reduce enter/leave oscillation.
+
+This separation is the main extension mechanism: new behavior usually means adding a filter, an effect, or both.
 
 ## Hardware Command Model
 ### Elevation
@@ -229,27 +214,11 @@ Effects available include:
 ### Emulator synchronization
 All outgoing commands update emulator GUI state/logs even when hardware is disconnected.
 
-## Important Invariants
-1. Depth resolution invariant
-- Depth map pixel resolution is controlled by hardware display resolution and depth layer multiplier only.
-- Runtime ppm changes do not redefine depth layer resolution.
-
-2. Capture scaling invariant
-- capture_region.scale_factor controls capture window size only.
-- Scale factor increases context, not final depth output dimensions.
-
-3. Texture-depth alignment
-- Texture layer resolution equals depth layer resolution.
-- Edge texture and depth map are spatially aligned.
-
-4. Stationary mouse vibration behavior
-- Texture-based vibration sends intensity off commands when cursor is not moving.
-
 ## Dataflow Summary
 1. Capture thread fills a larger scaled capture buffer.
-2. Render thread crops exact region and runs renderers.
-3. GraphicRenderer produces depth map and edge texture.
-4. TextureVibrationRenderer emits vibration intensity from edge energy.
+2. Render thread processes hardware and event states and runs renderers.
+3. GraphicRenderer produces depth map and edge texture from images.
+4. TextureVibrationRenderer emits vibration intensity from edge energy on images.
 5. ElevationRenderer emits center-pixel elevation.
 6. Handler system can emit additional event-driven effects.
 7. Hardware driver arbitrates and transmits commands.
@@ -320,37 +289,105 @@ return [
 3. Route commands through HardwareDriver methods.
 4. Tune via software/hardware config parameters.
 
-Example A (event-driven):
-- Goal: play a short vibration effect whenever entering a graphic object.
+Example:
+- Goal: encode button size as a haptic cue (small/medium/large) on enter.
+
+```python
+# filters.py
+import controlTypes
+
+class ButtonFilter(ObjectFilter):
+  """Match only button-like controls."""
+  BUTTON_ROLES = {
+    controlTypes.Role.BUTTON,
+    controlTypes.Role.TOGGLEBUTTON,
+    controlTypes.Role.SPLITBUTTON,
+  }
+
+  def matches(self, plugin, obj):
+    if not obj:
+      return False
+    role = getattr(obj, 'role', None)
+    return role in self.BUTTON_ROLES
+```
+
+```python
+# effects.py
+class ObjectSizeCueEffect(Effect):
+  def __init__(self, priority=50, small_id=3, medium_id=5, large_id=9):
+    self.priority = int(max(0, min(255, priority)))
+    self.small_id = small_id
+    self.medium_id = medium_id
+    self.large_id = large_id
+
+  def __call__(self, handler, obj=None, **kwargs):
+    if obj is None or getattr(obj, 'location', None) is None:
+      return
+
+    area = max(1, int(obj.location.width) * int(obj.location.height))
+    if area < 20_000:
+      effect_id = self.small_id
+      intensity = 60
+    elif area < 120_000:
+      effect_id = self.medium_id
+      intensity = 110
+    else:
+      effect_id = self.large_id
+      intensity = 170
+
+    handler.plugin.hardware.send_vibration_effects(self.priority, [effect_id])
+    handler.plugin.hardware.send_vibration_intensity(self.priority, intensity)
+```
 
 ```python
 # render_pipeline.py (inside _create_handlers)
-from .effects import ComboEffect, VibrationEffect
+from .effects import ComboEffect, ObjectSizeCueEffect, VibrationIntensityEffect
 from .handlers import ObjectHandler
-from .filters import GraphicFilter
+from .filters import ButtonFilter
 
 self.object_handlers.append(
   ObjectHandler(
-    filter=GraphicFilter(),
+    filter=ButtonFilter(),
     effects={
-      'enter': ComboEffect([
-        VibrationEffect(effect_ids=[7], priority=40),
-      ]),
-      'leave': ComboEffect([
-        VibrationEffect(effect_ids=[8], priority=40),
-      ]),
+      'enter': ObjectSizeCueEffect(priority=50),
+      'leave': VibrationIntensityEffect(intensity=0, priority=50)
     },
   )
 )
 ```
 
-Example B (frame-driven):
-- Goal: emit stronger vibration when texture activity is high while moving.
-- Implementation path: extend TextureVibrationRenderer with alternate activity metric
-  (for example p95-only, Sobel energy, or thresholded edge density), then expose
-  a renderer config key such as "activity_mode": "p95".
-
 ## Operational Notes
-- This addon expects NVDA runtime modules and platform-specific integrations.
-- Static analysis outside NVDA may report unresolved imports for NVDA/wx/songbird modules.
-- Those environment-specific diagnostics are expected in non-NVDA development contexts.
+### Basics of NVDA Addons
+
+- [NVDA Developer Guide](https://download.nvaccess.org/documentation/developerGuide.html) is semi-helpful for the overall API capabilities but has very minimal examples
+- Best way to start developing is to examine source code for existing addons or ask AI coding tools to create templates for functionality
+- Important note: addons are essentially a collection of plugins, and each plugin is a python package. If there is more than one file inside a python package you need to specific the entry point within the __init__ py or else it will be treated as separate packages
+- Steps for setting the right NVDA settings
+    1. NVDA key is set to insert/numpad 0 by default
+    2. Use NVDA+n and go Preferences>Settings
+    3. In Vision tab enable all highlighting options to highlight focus (blue), navigator (red), and cursor (yellow)
+    4. In Mouse enable report object when mouse enters it (this facilitates spatial scanning rather than keyboard based scanning)
+    5. In Advanced check enable loading custom code from scratchpad directory
+- Differentiating between main NVDA objects
+    - Focus (blue): what object is currently accepting inputs/is clicked on
+    - Cursor (yellow): where text is inserted
+    - Navigator (red): purely accessibility concept, what the screen reader is currently reading (looking without touching)
+- Steps for testing addon code:
+    1. Copy contents of addon folder into NVDA scratchpad directory C:\Users\<user>\AppData\Roaming\nvda\scratchpad (replacing existing files)
+    2. Run NVDA
+    3. Use key command NVDA+F1 to open log for debugging
+    4. Note: log window is not live and only updates when window is refocused. When window is refocused it also prints out all of the attributes of the current navigator object (red square)
+
+### Dependency Issues
+
+- Unfortunately since NVDA has its own python environment you cannot pre-install addon python dependencies other than what is already installed (specifically opencv and a screen capturing library are necessary)
+- Worked around this by copying a method used by another NVDA addon [AI Content Describer](https://github.com/cartertemm/AI-content-describer/tree/main)
+- Steps for adding dependencies
+    1. Create an identical Python environment to NVDA (currently Python 3.11 32-bit) which is easiest using new [Windows Python Installer](https://www.python.org/downloads/) which allows CLI interface for installing specific python versions using py -m install 3.11-32 for example
+    2. Install the desired dependencies in this python environment (make sure to use py -3.11 -m pip install <library> if you have multiple versions installed)
+    3. Copy the entire library folder from C:\Users\<user>\AppData\Local\Python\<version>\Lib\site-packages
+    4. Paste the library folder in a custom directly within the nvda root folder (C:\Users\<user>\AppData\Roaming\nvda
+    5. Remove any _pycache_ folders from the library (not sure if this is strictly necessary but it may prevent conflicts when used on different machines)
+    6. Also paste in deps folder in the software repo for sharing
+    7. To use the dependency in the addon a program needs to temporatrily add the custom dependency directory to path (which is done automatically in the dependencies module, so you just need to add the dependency to the list of imports in dependencies and dependency checker modules)
+    8. Note: the end user will not have this custom dependency folder so the addon needs to download it from an online github release (this has not been tested yet but copying the way it was done in the other addon should work)
