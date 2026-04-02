@@ -35,6 +35,25 @@ class ObjectHandlerManager(HandlerManager):
             if handler.matches(obj):
                 handler.handle_event(event_name, obj, **kwargs)
 
+    def dispatch_mouse_transitions(self, obj, mouse_pos):
+        """Dispatch enter/leave transitions per-handler using handler-owned entered object state."""
+        for handler in self.handlers:
+            if handler.entered_object is None:
+                if handler.matches(obj):
+                    handler.entered_object = obj
+                    handler.handle_event('enter', obj)
+                continue
+
+            if handler.has_exited_entered_object(mouse_pos):
+                previous_obj = handler.entered_object
+                handler.entered_object = None
+                handler.handle_event('leave', previous_obj)
+
+                # If cursor is already inside another matching object after leaving, re-enter immediately.
+                if handler.matches(obj):
+                    handler.entered_object = obj
+                    handler.handle_event('enter', obj)
+
 class GlobalHandlerManager(HandlerManager):
     def dispatch_events(self):
         """Dispatch events for all active global handlers."""
@@ -55,6 +74,7 @@ class ObjectHandler:
         self.plugin = None
         self.filter = filter
         self.effects = effects or {}
+        self.entered_object = None
         
     def set_plugin(self, plugin):
         """Set the parent plugin for this handler."""
@@ -83,6 +103,20 @@ class ObjectHandler:
                 logMessage(f"[ERROR] Effect '{event_name}' failed in {self.__class__.__name__}: {e}")
                 import traceback
                 logMessage(traceback.format_exc())
+
+    def has_exited_entered_object(self, mouse_pos):
+        """Return True when cursor is outside current entered object's bounding box."""
+        if self.entered_object is None:
+            return True
+
+        location = getattr(self.entered_object, 'location', None)
+        if location is None:
+            return True
+
+        return not (
+            location.left <= mouse_pos[0] < (location.left + location.width)
+            and location.top <= mouse_pos[1] < (location.top + location.height)
+        )
     
 class GlobalHandler:
     """Class to handle global NVDA events."""

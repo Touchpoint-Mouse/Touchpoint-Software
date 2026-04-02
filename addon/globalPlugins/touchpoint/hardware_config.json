@@ -4,7 +4,8 @@
         "elevation": 16,
         "elevation_speed": 17,
         "vibration_effect": 32,
-        "vibration_intensity": 33
+        "vibration_intensity": 33,
+        "pixels_per_mm": 48
     },
     "serial": {
         "port": "COM5",
@@ -12,7 +13,10 @@
     },
     "display": {
         "aspect_ratio": 0.625,
-        "resolution": 36.0
+        "resolution": 36.0,
+        "width_mm": 22.25,
+        "height_mm": 31,
+        "initial_pixels_per_mm": 2.0
     },
     "elevation": {
         "max_elevation": 1,
@@ -20,5 +24,11 @@
     },
     "vibration": {
         "max_intensity": 127
+    },
+    "command_enable": {
+        "elevation": true,
+        "vibration_effect": true,
+        "vibration_intensity": true,
+        "dynamic_capture_resize": true
     }
 }

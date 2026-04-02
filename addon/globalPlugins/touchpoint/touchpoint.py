@@ -54,6 +54,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Capture region configuration - centered on mouse with size from software config
         self.capture_region_width = capture_width
         self.capture_region_height = capture_height
+        self.capture_region_lock = threading.Lock()
         
         # Initialize all layers with starting region bounds
         initial_region = Rect(left=0, top=0, width=self.capture_region_width, height=self.capture_region_height)
@@ -65,6 +66,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         # Mouse position tracking (updated by event thread)
         self.mouse_position = (0, 0)
         self.mouse_position_lock = threading.Lock()
+        self.last_mouse_object = None
+        self.last_mouse_object_id = None
         
         # Debug logging timer
         self.last_debug_log_time = 0
@@ -103,6 +106,11 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             # Initialize emulator with hardware settings
             self.emulator_gui.set_max_elevation(self.hardware.max_elevation)
             self.emulator_gui.set_elevation_speed(self.hardware.max_elevation_speed)
+            self.emulator_gui.set_capture_region_size(
+                self.capture_region_width,
+                self.capture_region_height,
+                pixels_per_mm=self.hardware.last_pixels_per_mm,
+            )
             
             # Start render thread
             self.render_thread = threading.Thread(target=self._render_thread, daemon=True)
@@ -123,6 +131,37 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         with self.mouse_position_lock:
             return self.mouse_position
+
+    def get_mouse_object(self):
+        """Get the object currently tracked under the mouse by the render thread."""
+        return self.last_mouse_object
+
+    def _get_object_identity(self, obj):
+        """Build a stable identity key for mouse-enter/leave object tracking."""
+        if obj is None:
+            return None
+
+        location = getattr(obj, 'location', None)
+        location_key = None
+        if location is not None:
+            location_key = (location.left, location.top, location.width, location.height)
+
+        return (
+            getattr(obj, 'windowHandle', None),
+            getattr(obj, 'role', None),
+            getattr(obj, 'name', None),
+            location_key,
+        )
+
+    def _dispatch_mouse_object_transitions(self, mouse_pos):
+        """Dispatch object enter/leave events from render thread using per-handler state."""
+        try:
+            obj = NVDAObjects.NVDAObject.objectFromPoint(int(mouse_pos[0]), int(mouse_pos[1]))
+            self.last_mouse_object = obj
+            self.last_mouse_object_id = self._get_object_identity(obj)
+            self.render_pipeline.object_handler_manager.dispatch_mouse_transitions(obj, mouse_pos)
+        except Exception as e:
+            logMessage(f"[ERROR] Mouse object transition dispatch failed: {e}")
     
     def _log_object_under_mouse(self, mouse_pos):
         """Log information about the object under the mouse cursor.
@@ -181,6 +220,24 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def get_screen_size(self):
         """Get the full screen size as (width, height)."""
         return self.screen_size
+
+    def set_capture_region_size(self, width, height, pixels_per_mm=None):
+        """Dynamically update capture region size in pixels."""
+        width = max(1, int(round(width)))
+        height = max(1, int(round(height)))
+
+        resized = False
+        with self.capture_region_lock:
+            if width != self.capture_region_width or height != self.capture_region_height:
+                self.capture_region_width = width
+                self.capture_region_height = height
+                resized = True
+
+        if resized:
+            logMessage(f"Capture region resized to {width}x{height} px (ppm={pixels_per_mm})")
+
+        if self.emulator_gui:
+            self.emulator_gui.set_capture_region_size(width, height, pixels_per_mm=pixels_per_mm)
     
     def _render_thread(self):
         """Thread to track mouse position and trigger handlers."""
@@ -192,13 +249,20 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             with self.mouse_position_lock:
                 # Update mouse position variable
                 self.mouse_position = current_pos
+
+            # Route mouse enter/leave event transitions through render thread to avoid cross-thread conflicts.
+            self._dispatch_mouse_object_transitions(current_pos)
             
+            with self.capture_region_lock:
+                capture_w = self.capture_region_width
+                capture_h = self.capture_region_height
+
             # Calculate new region centered on current mouse position
             new_region = Rect(
-                left=current_pos[0] - self.capture_region_width // 2,
-                top=current_pos[1] - self.capture_region_height // 2,
-                width=self.capture_region_width,
-                height=self.capture_region_height
+                left=current_pos[0] - capture_w // 2,
+                top=current_pos[1] - capture_h // 2,
+                width=capture_w,
+                height=capture_h
             )
             
             # Update region bounds and execute render cycle
