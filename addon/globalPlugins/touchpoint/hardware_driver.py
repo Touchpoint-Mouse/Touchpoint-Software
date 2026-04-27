@@ -36,6 +36,8 @@ class HardwareDriver:
         self.health_check_thread = None
         self.health_check_running = False
         self.health_check_sleep = 0.5
+        self.health_check_ping_attempts = 3
+        self.health_check_ping_timeout_ms = 1000
         
         # Current elevation state
         self.elevation = 0.0
@@ -130,8 +132,8 @@ class HardwareDriver:
         
         response = None
         timeout_count = 0
-        while not response and timeout_count < 10:
-            response = self.uart_core.wait_for_header(self.H_PING, 1000)
+        while not response and timeout_count < self.health_check_ping_attempts:
+            response = self.uart_core.wait_for_header(self.H_PING, self.health_check_ping_timeout_ms)
             self.uart_core.flush()
             timeout_count += 1
         
@@ -183,6 +185,10 @@ class HardwareDriver:
                     # Update emulator GUI hardware status if available
                     if self.plugin.emulator_gui:
                         self.plugin.emulator_gui.set_hardware_status(False)
+                    try:
+                        self.uart.close()
+                    except Exception:
+                        pass
                 else:
                     if not self.hardware_connected:
                         logMessage("Hardware reconnected successfully")
