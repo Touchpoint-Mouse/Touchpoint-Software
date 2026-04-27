@@ -536,8 +536,10 @@ class GraphicRenderer(Renderer):
         ksize=7,
         invert=1,
         elevation_scale=0.5,
+        grayscale_elevation=True,
         edge_enhance=True,
         edge_weight=0.3,
+        edge_polarity_hysteresis=8.0,
         edge_canny_low=60,
         edge_canny_high=140,
         edge_dilate_iterations=1,
@@ -556,6 +558,8 @@ class GraphicRenderer(Renderer):
             ksize: Gaussian blur kernel size (odd integer; <=1 disables blur)
             invert: 1 for normal, -1 for inverted depth map
             elevation_scale: Scalar applied to normalized depth prior to max elevation scaling
+            grayscale_elevation: When False, disables grayscale-based base depth and keeps edge-only cues
+            edge_polarity_hysteresis: Intensity deadband around mouse brightness used for edge polarity hysteresis
         """
         self.capture_layer = capture_layer
         self.depth_layer = depth_layer
@@ -564,8 +568,10 @@ class GraphicRenderer(Renderer):
         self.ksize = int(ksize)
         self.invert = -1 if invert == -1 else 1
         self.elevation_scale = float(elevation_scale)
+        self.grayscale_elevation = bool(grayscale_elevation)
         self.edge_enhance = bool(edge_enhance)
         self.edge_weight = max(0.0, float(edge_weight))
+        self.edge_polarity_hysteresis = max(0.0, float(edge_polarity_hysteresis))
         self.edge_canny_low = max(0, int(edge_canny_low))
         self.edge_canny_high = max(0, int(edge_canny_high))
         self.edge_dilate_iterations = max(0, int(edge_dilate_iterations))
@@ -581,6 +587,7 @@ class GraphicRenderer(Renderer):
         self._effective_invert = (self.invert == -1)
         self._pending_invert = self._effective_invert
         self._pending_invert_frames = 0
+        self._edge_polarity_map = None
 
     def _count_blobs(self, binary_img):
         """Count connected components above area threshold in a binary image."""
@@ -688,7 +695,7 @@ class GraphicRenderer(Renderer):
                 self._zero_depth()
                 return
 
-            depth_map = cv2.cvtColor(capture_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            grayscale_map = cv2.cvtColor(capture_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
 
             # Build a depth-corresponding working grid that still preserves extra capture context.
             # This yields a larger working map when capture scale_factor > 1, then final crop
@@ -704,10 +711,10 @@ class GraphicRenderer(Renderer):
             work_width = max(target_width, int(round(target_width * capture_to_depth_scale_x)))
             work_height = max(target_height, int(round(target_height * capture_to_depth_scale_y)))
 
-            if depth_map.shape[1] != work_width or depth_map.shape[0] != work_height:
-                depth_map = cv2.resize(depth_map, (work_width, work_height), interpolation=cv2.INTER_AREA)
+            if grayscale_map.shape[1] != work_width or grayscale_map.shape[0] != work_height:
+                grayscale_map = cv2.resize(grayscale_map, (work_width, work_height), interpolation=cv2.INTER_AREA)
 
-            edge_input_u8 = np.clip(depth_map, 0, 255).astype(np.uint8)
+            edge_input_u8 = np.clip(grayscale_map, 0, 255).astype(np.uint8)
             if self.edge_blur_ksize > 1:
                 edge_input_u8 = cv2.GaussianBlur(edge_input_u8, (self.edge_blur_ksize, self.edge_blur_ksize), 0)
 
@@ -722,9 +729,9 @@ class GraphicRenderer(Renderer):
                 scaled_kernel += 1
 
             if scaled_kernel > 1:
-                depth_map = cv2.GaussianBlur(depth_map, (scaled_kernel, scaled_kernel), 0)
+                grayscale_map = cv2.GaussianBlur(grayscale_map, (scaled_kernel, scaled_kernel), 0)
 
-            gray_u8 = np.clip(depth_map, 0, 255).astype(np.uint8)
+            gray_u8 = np.clip(grayscale_map, 0, 255).astype(np.uint8)
 
             # Blob-count polarity decision is confined to the hovered object's bbox.
             bbox_local = image_region.global_to_local(region.top_left())
@@ -743,9 +750,12 @@ class GraphicRenderer(Renderer):
                 desired_invert = self._decide_invert_from_blob_counts(gray_u8, bbox_scaled)
                 effective_invert = self._update_polarity_hysteresis(desired_invert)
 
-            depth_map = depth_map / 255.0
-            if effective_invert:
-                depth_map = 1.0 - depth_map
+            if self.grayscale_elevation:
+                depth_map = grayscale_map / 255.0
+                if effective_invert:
+                    depth_map = 1.0 - depth_map
+            else:
+                depth_map = np.zeros_like(grayscale_map, dtype=np.float32)
 
             edge_map = np.zeros_like(depth_map, dtype=np.float32)
             if self.edge_enhance and self.edge_weight > 0.0:
@@ -754,7 +764,29 @@ class GraphicRenderer(Renderer):
                     kernel = np.ones((3, 3), dtype=np.uint8)
                     edges = cv2.dilate(edges, kernel, iterations=self.edge_dilate_iterations)
                 edge_map = edges.astype(np.float32) / 255.0
-                depth_map = depth_map + (edge_map * self.edge_weight)
+
+                if self._edge_polarity_map is None or self._edge_polarity_map.shape != edge_map.shape:
+                    self._edge_polarity_map = np.ones(edge_map.shape, dtype=np.float32)
+
+                mouse_local_x = int(round((mouse_pos[0] - region.left) * work_width / max(1, region.width)))
+                mouse_local_y = int(round((mouse_pos[1] - region.top) * work_height / max(1, region.height)))
+                mouse_local_x = max(0, min(work_width - 1, mouse_local_x))
+                mouse_local_y = max(0, min(work_height - 1, mouse_local_y))
+                mouse_intensity = float(edge_input_u8[mouse_local_y, mouse_local_x])
+
+                lower_threshold = mouse_intensity - self.edge_polarity_hysteresis
+                upper_threshold = mouse_intensity + self.edge_polarity_hysteresis
+
+                edge_pixels = edge_map > 0.0
+                dark_edges = edge_pixels & (edge_input_u8 > upper_threshold)
+                bright_edges = edge_pixels & (edge_input_u8 < lower_threshold)
+
+                # Hysteresis: keep previous polarity for edges inside the deadband.
+                self._edge_polarity_map[bright_edges] = 1.0
+                self._edge_polarity_map[dark_edges] = -1.0
+
+                signed_edge_map = edge_map * self._edge_polarity_map
+                depth_map = depth_map + (signed_edge_map * self.edge_weight)
 
             max_elevation = float(self.plugin.hardware.get_max_elevation())
             depth_map = depth_map * self.elevation_scale * max_elevation
@@ -800,32 +832,43 @@ class GraphicRenderer(Renderer):
 class TextureVibrationRenderer(Renderer):
     """Renderer that converts edge texture activity into realtime vibration intensity."""
 
-    def __init__(self, texture_layer, priority=200, intensity_scale=1.0, min_intensity=0, max_intensity=127, smoothing_alpha=0.35):
+    def __init__(
+        self,
+        texture_layer,
+        priority=200,
+        intensity_scale=1.0,
+        min_intensity=0,
+        max_intensity=127,
+        gaussian_ksize=0,
+        acceleration_spike_threshold=2500.0,
+        acceleration_spike_intensity=20,
+        acceleration_spike_enabled=True,
+    ):
         self.texture_layer = texture_layer
         self.priority = max(0, min(255, int(priority)))
         self.intensity_scale = max(0.0, float(intensity_scale))
         self.min_intensity = max(0, min(255, int(min_intensity)))
         self.max_intensity = max(0, min(255, int(max_intensity)))
-        self.smoothing_alpha = min(1.0, max(0.0, float(smoothing_alpha)))
-        self._smoothed_intensity = 0.0
-        self._last_mouse_pos = None
+        self.gaussian_ksize = max(0, int(gaussian_ksize))
+        self.acceleration_spike_threshold = max(0.0, float(acceleration_spike_threshold))
+        self.acceleration_spike_intensity = max(0.0, float(acceleration_spike_intensity))
+        self.acceleration_spike_enabled = bool(acceleration_spike_enabled)
+        if self.gaussian_ksize > 1 and self.gaussian_ksize % 2 == 0:
+            self.gaussian_ksize += 1
+        self._idle_zero_sent = False
+        self._last_sent_intensity = None
 
     def __call__(self):
         try:
             if not self.plugin or not self.plugin.hardware:
                 return
 
-            mouse_pos = self.plugin.get_mouse_position() if hasattr(self.plugin, 'get_mouse_position') else None
-            if mouse_pos == self._last_mouse_pos:
-                self._smoothed_intensity *= (1.0 - self.smoothing_alpha)
-                self.plugin.hardware.send_vibration_intensity(self.priority, 0)
-                return
-            self._last_mouse_pos = mouse_pos
-
             texture_img = self.texture_layer.get_image()
             if texture_img.size == 0:
-                self._smoothed_intensity *= (1.0 - self.smoothing_alpha)
-                self.plugin.hardware.send_vibration_intensity(self.priority, 0)
+                if not self._idle_zero_sent:
+                    self.plugin.hardware.send_vibration_intensity(self.priority, 0, gauranteed=True)
+                    self._idle_zero_sent = True
+                    self._last_sent_intensity = 0
                 return
 
             if len(texture_img.shape) == 3 and texture_img.shape[2] > 1:
@@ -833,19 +876,45 @@ class TextureVibrationRenderer(Renderer):
             else:
                 texture_gray = texture_img
 
+            if self.gaussian_ksize > 1:
+                texture_gray = cv2.GaussianBlur(
+                    texture_gray,
+                    (self.gaussian_ksize, self.gaussian_ksize),
+                    0,
+                )
+
             texture_gray = texture_gray.astype(np.float32, copy=False)
-            mean_val = float(np.mean(texture_gray))
-            p90_val = float(np.percentile(texture_gray, 90))
-            activity = (0.7 * p90_val) + (0.3 * mean_val)
+            size = texture_gray.shape
+            activity = texture_gray[size[0] // 2, size[1] // 2]
 
-            raw_intensity = activity * self.intensity_scale
-            raw_intensity = max(self.min_intensity, min(self.max_intensity, raw_intensity))
-            self._smoothed_intensity = (
-                (1.0 - self.smoothing_alpha) * self._smoothed_intensity
-                + self.smoothing_alpha * raw_intensity
-            )
+            mouse_speed = self.plugin.get_mouse_speed()
+            mouse_acceleration = self.plugin.get_mouse_acceleration_magnitude()
 
-            intensity = int(round(self._smoothed_intensity))
+            spike_intensity = 0.0
+            if self.acceleration_spike_enabled and mouse_acceleration >= self.acceleration_spike_threshold:
+                spike_intensity = self.acceleration_spike_intensity
+
+            texture_intensity = 0.0
+            if mouse_speed > 0.0:
+                texture_intensity = activity * self.intensity_scale
+                texture_intensity = max(self.min_intensity, min(self.max_intensity, texture_intensity))
+
+            raw_intensity = texture_intensity + spike_intensity
+
+            if raw_intensity <= 0.0:
+                if not self._idle_zero_sent:
+                    self.plugin.hardware.send_vibration_intensity(self.priority, 0, gauranteed=True)
+                    self._idle_zero_sent = True
+                    self._last_sent_intensity = 0
+                return
+
+            self._idle_zero_sent = False
+
+            intensity = int(round(raw_intensity))
+            if self._last_sent_intensity == intensity:
+                return
+
+            self._last_sent_intensity = intensity
             self.plugin.hardware.send_vibration_intensity(self.priority, intensity)
         except Exception as e:
             logMessage(f"[ERROR] TextureVibrationRenderer failed: {e}")

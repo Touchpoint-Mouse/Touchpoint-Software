@@ -212,7 +212,7 @@ class HardwareDriver:
             for effect_id in effect_ids:
                 self.plugin.emulator_gui.set_vibration_effect(effect_id, priority)
             
-    def send_vibration_intensity(self, priority, intensity):
+    def send_vibration_intensity(self, priority, intensity, gauranteed=False):
         """Send a vibration intensity command to the device."""
         priority = self._to_byte(priority)
         intensity = self._to_byte(intensity)
@@ -229,7 +229,7 @@ class HardwareDriver:
             pkt = self.uart_core.create_packet(self.H_VIBRATION_INTENSITY)
             pkt.write_byte(priority)
             pkt.write_byte(intensity)
-            self.uart_core.send_packet(pkt)
+            self.uart_core.send_packet(pkt, guarantee_delivery=gauranteed)
                     
         # Update emulator GUI
         if self.plugin.emulator_gui:

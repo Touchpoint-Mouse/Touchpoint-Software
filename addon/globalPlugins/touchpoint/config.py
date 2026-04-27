@@ -109,14 +109,27 @@ class TouchpointConfig:
                 "capture_region": {"scale_factor": 1.0},
                 "layer_multipliers": {"depth": 4.0, "texture": 1.0},
                 "threading": {"capture": 0.01, "render": 0.01},
+                "motion_filter": {"window_size": 5},
                 "renderers": {
                     "graphic_renderer": {
                         "ksize": 7,
                         "invert": 1,
-                        "elevation_scale": 0.5
+                        "elevation_scale": 0.5,
+                        "grayscale_elevation": True,
+                        "edge_polarity_hysteresis": 8.0
                     },
                     "elevation_renderer": {
                         "priority": 1
+                    },
+                    "texture_vibration_renderer": {
+                        "priority": 200,
+                        "intensity_scale": 1.0,
+                        "min_intensity": 0,
+                        "max_intensity": 127,
+                        "gaussian_ksize": 0,
+                        "acceleration_spike_enabled": True,
+                        "acceleration_spike_threshold": 2500.0,
+                        "acceleration_spike_intensity": 20
                     }
                 }
             }

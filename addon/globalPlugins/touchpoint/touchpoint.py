@@ -12,6 +12,8 @@ import logHandler
 import winUser
 import threading
 import time
+import math
+from collections import deque
 import sys
 import os
 import ctypes
@@ -65,6 +67,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         
         # Mouse position tracking (updated by event thread)
         self.mouse_position = (0, 0)
+        self.mouse_velocity = (0.0, 0.0)
+        self.mouse_speed = 0.0
+        self.mouse_acceleration = (0.0, 0.0)
+        self.mouse_acceleration_magnitude = 0.0
+        motion_filter_cfg = self.config.software.get('motion_filter', {}) if hasattr(self.config, 'software') else {}
+        self.motion_filter_window = max(1, int(motion_filter_cfg.get('window_size', 5) or 5))
+        self._velocity_history = deque(maxlen=self.motion_filter_window)
+        self._acceleration_history = deque(maxlen=self.motion_filter_window)
+        self._prev_mouse_position = None
+        self._prev_mouse_velocity = (0.0, 0.0)
+        self._prev_motion_time = None
         self.mouse_position_lock = threading.Lock()
         self.last_mouse_object = None
         self.last_mouse_object_id = None
@@ -131,6 +144,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """
         with self.mouse_position_lock:
             return self.mouse_position
+
+    def get_mouse_velocity(self):
+        """Get the current mouse velocity vector in pixels/second."""
+        with self.mouse_position_lock:
+            return self.mouse_velocity
+
+    def get_mouse_speed(self):
+        """Get the current mouse speed magnitude in pixels/second."""
+        with self.mouse_position_lock:
+            return self.mouse_speed
+
+    def get_mouse_acceleration(self):
+        """Get the current mouse acceleration vector in pixels/second^2."""
+        with self.mouse_position_lock:
+            return self.mouse_acceleration
+
+    def get_mouse_acceleration_magnitude(self):
+        """Get the current mouse acceleration magnitude in pixels/second^2."""
+        with self.mouse_position_lock:
+            return self.mouse_acceleration_magnitude
 
     def get_mouse_object(self):
         """Get the object currently tracked under the mouse by the render thread."""
@@ -243,12 +276,61 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         """Thread to track mouse position and trigger handlers."""
         
         while self.enabled:
+            now = time.perf_counter()
             # Update current mouse position using NVDA's winUser
             current_pos = winUser.getCursorPos()
+
+            velocity_x = 0.0
+            velocity_y = 0.0
+            accel_x = 0.0
+            accel_y = 0.0
+            speed = 0.0
+            accel_magnitude = 0.0
+
+            if self._prev_motion_time is not None and self._prev_mouse_position is not None:
+                dt = now - self._prev_motion_time
+                if dt > 0.0:
+                    dx = float(current_pos[0] - self._prev_mouse_position[0])
+                    dy = float(current_pos[1] - self._prev_mouse_position[1])
+                    velocity_x = dx / dt
+                    velocity_y = dy / dt
+                    speed = math.hypot(velocity_x, velocity_y)
+
+                    accel_x = (velocity_x - self._prev_mouse_velocity[0]) / dt
+                    accel_y = (velocity_y - self._prev_mouse_velocity[1]) / dt
+                    accel_magnitude = math.hypot(accel_x, accel_y)
+
+            self._velocity_history.append((velocity_x, velocity_y))
+            self._acceleration_history.append((accel_x, accel_y))
+
+            if self._velocity_history:
+                filtered_velocity_x = sum(value[0] for value in self._velocity_history) / len(self._velocity_history)
+                filtered_velocity_y = sum(value[1] for value in self._velocity_history) / len(self._velocity_history)
+            else:
+                filtered_velocity_x = 0.0
+                filtered_velocity_y = 0.0
+
+            if self._acceleration_history:
+                filtered_accel_x = sum(value[0] for value in self._acceleration_history) / len(self._acceleration_history)
+                filtered_accel_y = sum(value[1] for value in self._acceleration_history) / len(self._acceleration_history)
+            else:
+                filtered_accel_x = 0.0
+                filtered_accel_y = 0.0
+
+            filtered_speed = math.hypot(filtered_velocity_x, filtered_velocity_y)
+            filtered_accel_magnitude = math.hypot(filtered_accel_x, filtered_accel_y)
+
+            self._prev_motion_time = now
+            self._prev_mouse_position = current_pos
+            self._prev_mouse_velocity = (velocity_x, velocity_y)
             
             with self.mouse_position_lock:
                 # Update mouse position variable
                 self.mouse_position = current_pos
+                self.mouse_velocity = (filtered_velocity_x, filtered_velocity_y)
+                self.mouse_speed = filtered_speed
+                self.mouse_acceleration = (filtered_accel_x, filtered_accel_y)
+                self.mouse_acceleration_magnitude = filtered_accel_magnitude
 
             # Route mouse enter/leave event transitions through render thread to avoid cross-thread conflicts.
             self._dispatch_mouse_object_transitions(current_pos)
